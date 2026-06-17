@@ -28,7 +28,7 @@
 - [规则配置](#规则配置)
 - [完整流程演示](#完整流程演示)
   - [演示一：正常发布全链路](#演示一正常发布全链路)
-  - [演示二：失败链路（包名重复 → 修复 → 重新校验）](#演示二失败链路包名重复--修复--重新校验)
+  - [演示二：失败链路（预检拒绝 + check 阶段错误 + 驳回）](#演示二失败链路预检拒绝--check-阶段错误--审批阻塞--驳回)
   - [演示三：发布 → 撤销回退 → 重新发布](#演示三发布--撤销回退--重新发布)
   - [演示四：断点续跑（一键到发布）](#演示四断点续跑一键到发布)
 - [数据持久化说明](#数据持久化说明)
@@ -67,9 +67,10 @@ python -m patchgate.cli --help
 ├── config/
 │   └── rules.yaml      # 规则配置文件（可自定义）
 ├── examples/
-│   ├── manifest_good.json         # 正常清单示例
-│   ├── manifest_with_errors.json  # 含重复包名等错误的清单
-│   └── manifest_example.yaml      # YAML 格式示例
+│   ├── manifest_good.json                 # 正常清单示例
+│   ├── manifest_with_errors.json          # import 预检样本：含重复包名，import 当场拒绝 (rc=2, 零写入)
+│   ├── manifest_check_stage_errors.json   # check 阶段失败样本：过预检但缺 checksum，check 阶段阻塞审批
+│   └── manifest_example.yaml              # YAML 格式示例
 ├── patchgate_cli.py    # 快捷入口脚本
 ├── requirements.txt
 └── README.md
@@ -108,7 +109,12 @@ python patchgate_cli.py export  demo-001 -o release_summary.json -f json
 
 ### import - 导入清单创建批次
 
-**功能**：读取补丁清单，在数据库中创建一个新批次（状态 `created`）。
+**功能**：读取补丁清单，**先在内存中做预检**（包名必填、包名唯一性），只有通过预检才会在数据库中创建新批次（状态 `created`）。
+
+**预检机制（关键行为）**：
+- `package_name` 为空 → 当场报错并拒绝
+- 包名重复 → 逐条指出重复位置并**拒绝导入**
+- 预检失败时 **不创建批次、不写入任何数据库记录**、返回**退出码 2**
 
 **用法**：
 ```bash
@@ -132,6 +138,13 @@ patchgate import examples/manifest_good.json --name "Q2安全补丁"
 patchgate import examples/manifest_good.json --id "release-2026-06-20-01"
 ```
 
+**退出码**：
+| 退出码 | 含义 |
+|---|---|
+| `0` | 导入成功，批次已创建 |
+| `1` | 其他错误（文件不存在、解析失败、ID 重复等） |
+| `2` | **预检失败**（包名重复或空包名，数据库零写入） |
+
 ---
 
 ### check - 执行规则校验
@@ -153,7 +166,7 @@ patchgate check <BATCH_ID> [--rules RULES_YAML] [--continue-on-error]
 - 启用规则列表
 - 每项检查的通过/失败统计
 - 所有失败项的表格（序号、包名、规则名、级别、详细信息）
-- **包名重复会单独列出明细**（哪个包在哪几行重复）
+- *注意：包名重复/空包名在 import 预检阶段就会被拒绝，不会进入 check 阶段*
 
 ---
 
@@ -366,7 +379,7 @@ patchgate list
 |---|---|
 | `created` | `checking` |
 | `checking` | `check_passed` / `check_failed` |
-| `check_failed` | `checking` |
+| `check_failed` | `checking` / `rejected` |
 | `check_passed` | `approved` / `rejected` |
 | `rejected` | `checking` |
 | `approved` | `published` |
@@ -544,78 +557,133 @@ $ python patchgate_cli.py export demo-normal-01 -o release_report.md -f markdown
 
 ---
 
-### 演示二：失败链路（包名重复 → 修复 → 重新校验）
+### 演示二：失败链路（预检拒绝 + check 阶段错误 + 审批阻塞 + 驳回）
 
-**Step 1 - 导入含错误清单**
+失败链路分两层：**第一层是 import 当场拒绝（包名重复/空包名）**，根本不会进闸门；
+**第二层是 import 通过但 check 阶段触发 error 级规则**，此时批次被锁，审批被阻塞。
+
+---
+
+#### Part 1：import 预检拒绝（当场、零写入、退出码 2）
+
+`examples/manifest_with_errors.json` 中有 2 组重复包名 + 1 条空包名，**import 阶段当场拒绝，不创建批次，数据库零写入**。
+
 ```bash
-$ python patchgate_cli.py import examples/manifest_with_errors.json --name "重复包名测试" --id "demo-err-01"
-✓ 批次创建成功
-  ...
+$ python patchgate_cli.py --no-color import examples/manifest_with_errors.json \
+    --id "demo-precheck-fail" --name "预检被拒批次"
+[FAIL] 清单预检失败，拒绝导入
+  共发现 5 项错误:
+
++------+---------------+--------+-------------------------------------------------+
+| 行号   | 包名            | 错误类型   | 详细信息                                            |
++======+===============+========+=================================================+
+| #6   | (空)           | 包名必填   | package_name 字段缺失或为空                            |
++------+---------------+--------+-------------------------------------------------+
+| #1   | auth-service  | 包名重复   | 同时出现在第 [1, 4] 行 (共 2 处, 版本: ['2.4.1', '2.4.0']) |
++------+---------------+--------+-------------------------------------------------+
+| #4   | auth-service  | 包名重复   | 同时出现在第 [1, 4] 行 (共 2 处, 版本: ['2.4.1', '2.4.0']) |
++------+---------------+--------+-------------------------------------------------+
+| #2   | order-service | 包名重复   | 同时出现在第 [2, 5] 行 (共 2 处, 版本: ['3.1.0', '3.0.9']) |
++------+---------------+--------+-------------------------------------------------+
+| #5   | order-service | 包名重复   | 同时出现在第 [2, 5] 行 (共 2 处, 版本: ['3.1.0', '3.0.9']) |
++------+---------------+--------+-------------------------------------------------+
+
+修复清单后请重新执行 import 命令
+# 退出码: 2
+# 数据库: batches=0, manifest_items=0, check_results=0,
+#          approvals=0, publish_records=0, status_history=0
+```
+
+> **验收口径**：预检失败的批次 ID 无论怎样也不会出现在 `list` / `status` 里，数据库里查不到任何与此 ID 相关的记录。
+
+---
+
+#### Part 2：import 通过 + check 阶段触发 error 级规则
+
+改用 `examples/manifest_check_stage_errors.json` —— 包名不重复、无空包名（能通过 import 预检），但 3 个包缺 `checksum`，配了 `checksum_required: error` 规则就会在 check 阶段阻塞。
+
+**Step 1 - import 通过（预检放行）**
+```bash
+$ python patchgate_cli.py --no-color import examples/manifest_check_stage_errors.json \
+    --id "demo-check-fail-01" --name "check阶段错误测试"
+[OK] 批次创建成功
+  批次 ID   : demo-check-fail-01
+  名称      : check阶段错误测试
+  清单文件  : .../examples/manifest_check_stage_errors.json
+  清单摘要  : ca3f249ecf4a9a84
+  条目数量  : 4
   当前状态  : created
+
+下一步建议:
+  patchgate check demo-check-fail-01
+# 退出码: 0
 ```
 
-**Step 2 - 校验：包名重复等错误被明确指出**
+**Step 2 - check：触发 checksum error，状态置为 CHECK_FAILED**
 ```bash
-$ python patchgate_cli.py check demo-err-01
-▶ 开始校验批次 demo-err-01 ...
-  启用规则数: 4
+$ python patchgate_cli.py --no-color check demo-check-fail-01 \
+    --rules config/rules_test_checksum_error.yaml
+[>] 开始校验批次 demo-check-fail-01 ...
+  启用规则数: 5
+    - duplicate_package_name: 包名唯一性检查 [ERROR]
+    - package_name_required: 包名必填检查 [ERROR]
+    - version_format: 版本号格式检查 [WARNING]
+    - checksum_required: 校验和必填检查 [ERROR]
+    - source_path_exists: 源路径存在性检查 [WARNING]
 
 ═════════════════════════════════════════════════
-  校验摘要: 共 28 项检查
-    通过 : 16   失败 : 10   警告 : 3   错误 : 7   跳过 : 2
+  校验摘要: 共 17 项检查
+    通过 : 9   失败 : 8   警告 : 5   错误 : 3   跳过 : 0
 ═════════════════════════════════════════════════
 
-✗ 失败项详情:
-+-------+--------------+----------------+--------+-----------------------------------------------------+
-|   序号 | 包名         | 规则           | 级别   | 详细信息                                            |
-+=======+==============+================+========+=====================================================+
-|     1 | auth-service | 包名唯一性检查 | ERROR  | 包名重复: 'auth-service' 在第 [1, 4] 行重复出现(共2处) |
-+-------+--------------+----------------+--------+-----------------------------------------------------+
-|     4 | auth-service | 包名唯一性检查 | ERROR  | 包名重复: 'auth-service' 在第 [1, 4] 行重复出现(共2处) |
-+-------+--------------+----------------+--------+-----------------------------------------------------+
-|     2 | order-service| 包名唯一性检查 | ERROR  | 包名重复: 'order-service' 在第 [2, 5] 行重复出现(共2处) |
-+-------+--------------+----------------+--------+-----------------------------------------------------+
-|     5 | order-service| 包名唯一性检查 | ERROR  | 包名重复: 'order-service' 在第 [2, 5] 行重复出现(共2处) |
-+-------+--------------+----------------+--------+-----------------------------------------------------+
-|     6 | (空)         | 包名必填检查   | ERROR  | 第 6 条清单缺少 package_name 字段或为空                 |
-+-------+--------------+----------------+--------+-----------------------------------------------------+
-| ...   | ...          | 版本号格式检查 | WARNING| 版本号 'not-a-semver' 不符合语义化版本格式            |
-+-------+--------------+----------------+--------+-----------------------------------------------------+
+[FAIL] 失败项详情:
++------+---------------+----------+--------+----------------------------------------+
+| 序号   | 包名            | 规则       | 级别     | 详细信息                                   |
++======+===============+==========+========+========================================+
+| #1   | service-alpha | 校验和必填检查  | ERROR  | 包 'service-alpha' 缺少 checksum 校验和      |
+| #2   | service-beta  | 校验和必填检查  | ERROR  | 包 'service-beta' 缺少 checksum 校验和       |
+| #3   | service-gamma | 校验和必填检查  | ERROR  | 包 'service-gamma' 缺少 checksum 校验和      |
+| #4   | service-delta | 版本号格式检查  | WARNING| 版本号 'not-semver' 不符合语义化版本格式 (x.y.z) |
+| ...  | （4 条源路径不存在 WARNING，仅告警不阻塞）                              |
++------+---------------+----------+--------+----------------------------------------+
 
-⚠ 包名重复明细:
-  • 'auth-service' 出现在行号: [0, 3]  (重复 2 次, 版本: ['2.4.1', '2.4.0'])
-  • 'order-service' 出现在行号: [1, 4]  (重复 2 次, 版本: ['3.1.0', '3.0.9'])
-
-✗ 存在未解决的错误项，后续审批被阻塞。
+[FAIL] 存在未解决的错误项，后续审批被阻塞。
+  如需忽略请使用 --continue-on-error，或修复清单后重新执行 check。
+# 退出码: 2，当前状态: CHECK_FAILED
 ```
 
-**Step 3 - 审批被阻塞**
+**Step 3 - 审批被阻塞（默认拦截）**
 ```bash
-$ python patchgate_cli.py approve demo-err-01 --approver zhangsan
+$ python patchgate_cli.py --no-color approve demo-check-fail-01 --approver zhangsan
 错误: 批次状态为 CHECK_FAILED，存在未解决的失败项。
   请先修复问题并重新 check，或使用 --force 强制审批。
-  当前未解决失败项共 10 个：
-    - [error] 包名唯一性检查: 包名重复: 'auth-service' 在第 [1, 4] 行重复出现 (共 2 处)
-    - [error] 包名唯一性检查: 包名重复: 'auth-service' 在第 [1, 4] 行重复出现 (共 2 处)
-    - ...
+  当前未解决失败项共 8 个：
+    - [error] 校验和必填检查: 包 'service-alpha' 缺少 checksum 校验和
+    - [error] 校验和必填检查: 包 'service-beta' 缺少 checksum 校验和
+    - [error] 校验和必填检查: 包 'service-gamma' 缺少 checksum 校验和
+    ... 等共 8 项
+# 退出码: 1，批次仍停留在 CHECK_FAILED
 ```
 
-**Step 4 - 修复清单 + 重新校验**
+**Step 4 - 选择驳回（CHECK_FAILED → REJECTED，新状态流转已支持）**
 
-用编辑器修复 `examples/manifest_with_errors.json`：删除重复的 auth-service/order-service 行、补齐第 6 条的 package_name。
+此时除了修复问题重新 check，也可以直接驳回：
 
 ```bash
-# 再次 check 即可从 check_failed 流转回 checking
-$ python patchgate_cli.py check demo-err-01
-...
-✓ 校验通过，状态已更新为: CHECK_PASSED
+$ python patchgate_cli.py --no-color reject demo-check-fail-01 \
+    --approver zhangsan --comment "checksum 必须补齐才能放行"
+[FAIL] 审批已驳回
+  批次 ID   : demo-check-fail-01
+  审批人     : zhangsan
+  驳回原因   : checksum 必须补齐才能放行
+  当前状态   : REJECTED
+  修复后请重新执行: patchgate check demo-check-fail-01
+# 退出码: 0
 ```
 
-**Step 5 - 正常审批发布**
-```bash
-$ python patchgate_cli.py approve demo-err-01 --approver zhangsan --comment "问题已修复"
-$ python patchgate_cli.py publish demo-err-01 --operator lisi
-```
+**Step 5 - 修复清单 + 重新 check → 审批 → 发布**
+
+修复 checksum 后，`check` 会自动从 `rejected` → `checking` → `check_passed`，后续审批发布同正常链路。
 
 ---
 

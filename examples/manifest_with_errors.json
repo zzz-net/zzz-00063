@@ -1,5 +1,5 @@
 {
-  "batch_description": "故意包含重复包名的测试清单 - 用于演示失败链路",
+  "batch_description": "import 预检拒绝样本 - 含 2 组重复包名 + 1 空包名，import 会当场拒绝 (rc=2)，不落任何批次记录",
   "items": [
     {
       "package_name": "auth-service",
