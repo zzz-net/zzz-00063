@@ -468,6 +468,7 @@ def cmd_approve(args, storage: Storage) -> int:
     print(f"  审批备注   : {args.comment or '(无)'}")
     print(f"  当前状态   : {colorize('APPROVED', BatchStatus.APPROVED)}")
     print(f"  下一步: patchgate publish {args.batch_id} --operator <姓名>")
+    print(f"  或修改后重跑校验: patchgate check {args.batch_id}")
     return 0
 
 
@@ -573,9 +574,28 @@ def cmd_revoke(args, storage: Storage) -> int:
     print(f"  回退备注   : {args.comment}")
     print(f"  当前状态   : {colorize(final_status.value, final_status)}")
     if final_status == BatchStatus.APPROVED:
-        print(f"  (批次已恢复到审批通过状态，可直接重新发布或修改后重跑校验)")
-        print(f"  直接重新发布: patchgate publish {args.batch_id} --operator <姓名>")
-        print(f"  修改后重跑校验: patchgate check {args.batch_id}")
+        active_snap = storage.get_active_rule_snapshot(args.batch_id)
+        snap_info = ""
+        if active_snap:
+            snap_info = f" (沿用规则快照 #{active_snap['id']})"
+        print(f"  (批次已恢复到审批通过状态{snap_info})")
+        print()
+        print(f"  状态流转路径:")
+        print(f"    PUBLISHED  -(revoke)->  APPROVED")
+        print(f"    APPROVED   -(check)->   CHECKING  -(通过)->  CHECK_PASSED  -(approve)->  APPROVED  -(publish)-> PUBLISHED")
+        print(f"    APPROVED   -(publish)-> PUBLISHED  (不重跑校验，直接重发)")
+        print()
+        print(f"  后续操作:")
+        print(f"    ① 无需修改直接发布:")
+        print(f"       patchgate publish {args.batch_id} --operator <姓名>")
+        print(f"    ② 修改清单后重跑校验 (沿用原批次规则快照，不受外部配置变更影响):")
+        print(f"       patchgate check {args.batch_id}")
+        print(f"       patchgate approve {args.batch_id} --approver <姓名>")
+        print(f"       patchgate publish {args.batch_id} --operator <姓名>")
+        print(f"    ③ 确认规则快照与校验结果:")
+        print(f"       patchgate status {args.batch_id}")
+        print(f"       patchgate history {args.batch_id} -t rules")
+        print(f"       patchgate history {args.batch_id} -t status")
     return 0
 
 
@@ -972,8 +992,11 @@ def cmd_resume(args, storage: Storage) -> int:
     to_stage = args.to
 
     while stage != to_stage:
-        if stage == "created" or (stage in ("check_failed", "rejected", "revoked", "checking") and to_stage in ("check", "approve", "publish")):
-            print("→ 执行规则校验 ...")
+        if stage == "created" or (stage in ("check_failed", "rejected", "revoked", "checking") and to_stage in ("check", "approve", "publish")) or (stage == "approved" and to_stage == "check"):
+            if stage == "approved" and to_stage != "publish":
+                print("→ 从审批通过状态重新执行规则校验 ...")
+            else:
+                print("→ 执行规则校验 ...")
             storage.transition_status(args.batch_id, BatchStatus.CHECKING, "resume", "续跑-重新校验")
             result = engine.run_checks(args.batch_id, storage)
             _print_check_report(result, storage, args.batch_id, batch["items"])
@@ -1236,7 +1259,78 @@ def cmd_status(args, storage: Storage) -> int:
         for p in pubs:
             act = "发布" if p["action"] == "publish" else "撤销回退"
             print(f"  [{act}] {p['operator']} @ {p['created_at']}: {p.get('comment') or '(无)'}")
+    print()
+    _print_next_steps(st)
     return 0
+
+
+def _print_next_steps(st: BatchStatus):
+    mapping = {
+        BatchStatus.CREATED: {
+            "desc": "已导入但尚未校验",
+            "steps": [
+                "执行规则校验:  patchgate check <BATCH_ID>",
+                "或一键续跑:    patchgate resume <BATCH_ID> --to check",
+            ],
+        },
+        BatchStatus.CHECKING: {
+            "desc": "校验中（应尽快完成 check 或重新 check 以避免锁定状态，或调用 history 查看结果）",
+            "steps": [
+                "重新执行校验:  patchgate check <BATCH_ID>",
+                "查看校验详情:  patchgate history <BATCH_ID>",
+            ],
+        },
+        BatchStatus.CHECK_FAILED: {
+            "desc": "校验未通过，存在未解决失败项",
+            "steps": [
+                "修正清单后重跑:  patchgate check <BATCH_ID>",
+                "或驳回处理:      patchgate reject <BATCH_ID>",
+                "查看失败项:      patchgate status <BATCH_ID>",
+            ],
+        },
+        BatchStatus.CHECK_PASSED: {
+            "desc": "校验通过，等待审批",
+            "steps": [
+                "审批通过:  patchgate approve <BATCH_ID> --approver <姓名>",
+                "驳回:      patchgate reject <BATCH_ID>",
+            ],
+        },
+        BatchStatus.REJECTED: {
+            "desc": "已驳回，可修改后重新校验",
+            "steps": [
+                "修改清单后重跑校验:  patchgate check <BATCH_ID>",
+                "查看规则快照:        patchgate history <BATCH_ID> -t rules",
+            ],
+        },
+        BatchStatus.APPROVED: {
+            "desc": "审批通过，可直接发布或修改后重检",
+            "steps": [
+                "直接发布:           patchgate publish <BATCH_ID> --operator <姓名>",
+                "修改后重新校验:     patchgate check <BATCH_ID>",
+                "一键续跑至发布:   patchgate resume <BATCH_ID> --to publish --operator <姓名>",
+                "查看规则快照:       patchgate status <BATCH_ID>",
+            ],
+        },
+        BatchStatus.PUBLISHED: {
+            "desc": "已发布",
+            "steps": [
+                "查看发布历史:   patchgate history <BATCH_ID>",
+                "发现问题撤销:   patchgate revoke <BATCH_ID> --operator <姓名> --comment <原因>",
+            ],
+        },
+        BatchStatus.REVOKED: {
+            "desc": "已撤销发布（通常会自动回退到 APPROVED）",
+            "steps": [
+                "查看当前状态:       patchgate status <BATCH_ID>",
+                "按 APPROVED 建议:   patchgate status <BATCH_ID>（revoke 后自动回退）",
+            ],
+        },
+    }
+    info = mapping.get(st)
+    if info:
+        print(f"下一步建议 ({info['desc']}):")
+        for s in info['steps']:
+            print(f"  · {s}")
 
 
 def cmd_list(args, storage: Storage) -> int:

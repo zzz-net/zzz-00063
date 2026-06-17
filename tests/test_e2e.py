@@ -927,6 +927,143 @@ def test_rule_snapshot_resume(examples_dir, config_dir):
     print("\n[OK][OK] 回归测试 8 通过: resume 的规则快照行为正确 [OK][OK]")
 
 
+def test_revoke_docs_consistency(examples_dir):
+    """回归测试 9: revoke 后说明链路一致 - CLI 输出、状态流转、status 下一步建议 三处对齐"""
+    separator("回归测试 9: revoke 说明链路一致（CLI + 状态表 + status 建议）")
+
+    mid = f"{examples_dir}/manifest_good.json"
+    rc = run_cli("import", mid, "--id", "test-docs-consistency", "--name", "测试-revoke说明一致性")
+    assert rc == 0, "import 失败"
+
+    rc = run_cli("check", "test-docs-consistency")
+    assert rc == 0, "check 失败"
+
+    storage = Storage(TEST_DB)
+    snap_before = storage.get_active_rule_snapshot("test-docs-consistency")
+    assert snap_before is not None
+    snap_id_before = snap_before["id"]
+
+    rc = run_cli("approve", "test-docs-consistency", "--approver", "tester", "--comment", "审批通过")
+    assert rc == 0, "approve 失败"
+    rc = run_cli("publish", "test-docs-consistency", "--operator", "op", "--comment", "发布")
+    assert rc == 0, "publish 失败"
+    print("[OK] 已发布")
+
+    import io as _io
+    import contextlib
+    revoke_capture = _io.StringIO()
+    with contextlib.redirect_stdout(revoke_capture):
+        rc_revoke = cli_main(["--db", TEST_DB, "--no-color",
+                              "revoke", "test-docs-consistency",
+                              "--operator", "op", "--comment", "紧急回滚"])
+    assert rc_revoke == 0, "revoke 失败"
+    revoke_output = revoke_capture.getvalue()
+    assert "状态流转路径" in revoke_output, "revoke CLI 输出应包含状态流转路径"
+    assert "APPROVED   -(check)->" in revoke_output, "revoke CLI 输出应包含 APPROVED→CHECKING 路径"
+    assert "后续操作" in revoke_output, "revoke CLI 输出应包含后续操作"
+    assert "无需修改直接发布" in revoke_output, "revoke CLI 输出应包含直接发布选项"
+    assert "修改清单后重跑校验" in revoke_output, "revoke CLI 输出应包含重跑校验选项"
+    assert "沿用原批次规则快照" in revoke_output, "revoke CLI 输出应提示规则快照沿用"
+    assert f"沿用规则快照 #{snap_id_before}" in revoke_output, "revoke CLI 输出应包含沿用的快照 ID"
+    assert "确认规则快照与校验结果" in revoke_output, "revoke CLI 输出应包含确认方法"
+    assert "patchgate status" in revoke_output, "revoke CLI 输出应包含 status 命令"
+    assert "patchgate history" in revoke_output, "revoke CLI 输出应包含 history 命令"
+    assert "-t rules" in revoke_output, "revoke CLI 输出应提示查看规则快照历史"
+    assert "-t status" in revoke_output, "revoke CLI 输出应提示查看状态流转历史"
+    print("[OK] revoke CLI 输出完整：状态路径、后续操作（发布/重检/确认）、规则快照提示齐全")
+
+    batch_after_revoke = storage.get_batch("test-docs-consistency")
+    assert batch_after_revoke["status"] == BatchStatus.APPROVED.value, "revoke 后状态应为 APPROVED"
+    status_history = storage.get_status_history("test-docs-consistency")
+    transitions = [(h.get("from_status"), h["to_status"]) for h in status_history]
+    assert (BatchStatus.PUBLISHED.value, BatchStatus.REVOKED.value) in transitions
+    assert (BatchStatus.REVOKED.value, BatchStatus.APPROVED.value) in transitions
+    print(f"[OK] 状态历史正确：PUBLISHED→REVOKED→APPROVED（共 {len(status_history)} 条记录）")
+
+    from patchgate.models import BATCH_STATUS_FLOW
+    assert BatchStatus.CHECKING in BATCH_STATUS_FLOW[BatchStatus.APPROVED], \
+        "状态机表应允许 APPROVED → CHECKING 流转"
+    assert BatchStatus.PUBLISHED in BATCH_STATUS_FLOW[BatchStatus.APPROVED], \
+        "状态机表应允许 APPROVED → PUBLISHED 流转"
+    approved_targets = [s.value for s in BATCH_STATUS_FLOW[BatchStatus.APPROVED]]
+    assert "checking" in approved_targets and "published" in approved_targets
+    print(f"[OK] 状态机 BATCH_STATUS_FLOW：APPROVED 允许流转到 {approved_targets}")
+
+    status_capture = _io.StringIO()
+    with contextlib.redirect_stdout(status_capture):
+        rc_status = cli_main(["--db", TEST_DB, "--no-color", "status", "test-docs-consistency"])
+    assert rc_status == 0, "status 失败"
+    status_output = status_capture.getvalue()
+    assert "下一步建议" in status_output, "status 应输出下一步建议"
+    assert "审批通过，可直接发布或修改后重检" in status_output, "status 下一步建议应描述 APPROVED 状态"
+    assert "直接发布" in status_output, "status 下一步建议应包含直接发布"
+    assert "修改后重新校验" in status_output, "status 下一步建议应包含修改后重跑校验"
+    assert "一键续跑至发布" in status_output, "status 下一步建议应包含一键续跑"
+    assert f"#{snap_id_before}" in status_output, "status 应显示规则快照 ID"
+    assert "规则快照" in status_output, "status 应显示规则快照信息"
+    assert "关键校验项" in status_output, "status 应显示关键校验项"
+    print("[OK] status 输出：下一步建议（发布/重检/续跑）、规则快照、关键校验项齐全")
+
+    rc = run_cli("check", "test-docs-consistency")
+    assert rc == 0, "revoke 后从 APPROVED 执行 check 应成功"
+    batch_after_check = storage.get_batch("test-docs-consistency")
+    assert batch_after_check["status"] == BatchStatus.CHECK_PASSED.value
+    status_after = storage.get_status_history("test-docs-consistency")
+    latest_transitions = [(h.get("from_status"), h["to_status"]) for h in status_after[-2:]]
+    assert (BatchStatus.APPROVED.value, BatchStatus.CHECKING.value) in latest_transitions
+    assert (BatchStatus.CHECKING.value, BatchStatus.CHECK_PASSED.value) in latest_transitions
+    print(f"[OK] APPROVED→CHECKING→CHECK_PASSED 流转成功（最新 2 步: {latest_transitions}）")
+
+    snap_after_recheck = storage.get_active_rule_snapshot("test-docs-consistency")
+    assert snap_after_recheck["id"] == snap_id_before, "重新 check 后规则快照 ID 应不变"
+    assert snap_after_recheck["is_active"] is True, "快照仍应活动"
+    all_snaps = storage.get_rule_snapshots("test-docs-consistency")
+    assert len(all_snaps) == 1, "不应创建新快照"
+    print(f"[OK] 重新 check 后沿用原快照 #{snap_id_before}，未创建新快照")
+
+    rc = run_cli("approve", "test-docs-consistency", "--approver", "tester2", "--comment", "修复后再次审批")
+    assert rc == 0, "二次 approve 失败"
+    rc = run_cli("publish", "test-docs-consistency", "--operator", "op2", "--comment", "重新发布")
+    assert rc == 0, "二次 publish 失败"
+    batch_final = storage.get_batch("test-docs-consistency")
+    assert batch_final["status"] == BatchStatus.PUBLISHED.value
+    print("[OK] 完整链路：approve→publish 成功，最终状态 PUBLISHED")
+
+    pub_records = storage.get_publish_records("test-docs-consistency")
+    actions = [p["action"] for p in pub_records]
+    assert actions == ["publish", "revoke", "publish"], f"发布记录应为 publish→revoke→publish，实际 {actions}"
+    print(f"[OK] 发布历史动作顺序正确: {'→'.join(actions)}")
+
+    status_seq = [h["to_status"] for h in storage.get_status_history("test-docs-consistency")]
+    expected_parts = ["approved", "published", "revoked", "approved", "checking", "check_passed", "approved", "published"]
+    for ep in expected_parts:
+        assert ep in status_seq, f"状态流转序列应包含 '{ep}'，实际 {status_seq}"
+    print(f"[OK] 完整状态流转链包含全部关键节点: {' → '.join(status_seq)}")
+
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w", encoding="utf-8") as tf:
+        json_path = tf.name
+    try:
+        rc = run_cli("export", "test-docs-consistency", "-o", json_path, "-f", "json")
+        assert rc == 0, "export 失败"
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        assert data["rule_snapshot"]["id"] == snap_id_before
+        assert data["rule_snapshot"]["is_active"] is True
+        assert len(data["publish_history"]) == 3
+        assert data["status"] == BatchStatus.PUBLISHED.value
+        approved_to_checking_count = sum(
+            1 for h in data["status_history"]
+            if h.get("from") == BatchStatus.APPROVED.value
+            and h["to"] == BatchStatus.CHECKING.value
+        )
+        assert approved_to_checking_count >= 1, "导出的状态历史应包含 APPROVED → CHECKING"
+        print("[OK] JSON 导出：快照一致、状态历史完整、APPROVED→CHECKING 存在")
+    finally:
+        os.unlink(json_path)
+
+    print("\n[OK][OK] 回归测试 9 通过: revoke 说明链路（CLI/状态表/status/export）完全一致 [OK][OK]")
+
+
 def main():
     examples_dir, config_dir = cleanup()
     all_passed = True
@@ -946,6 +1083,7 @@ def main():
         ("回归-revoke后重发快照一致", lambda: test_rule_snapshot_revoke_republish(examples_dir)),
         ("回归-旧批次重新导出一致", lambda: test_rule_snapshot_re_export(examples_dir)),
         ("回归-resume的规则快照", lambda: test_rule_snapshot_resume(examples_dir, config_dir)),
+        ("回归-revoke说明链路一致", lambda: test_revoke_docs_consistency(examples_dir)),
     ]
     results = []
     for name, fn in tests:
