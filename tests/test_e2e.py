@@ -38,7 +38,8 @@ def cleanup():
         shutil.rmtree(d)
     os.makedirs(d, exist_ok=True)
     examples_dir = Path(_PROJECT_ROOT) / "examples"
-    return examples_dir
+    config_dir = Path(_PROJECT_ROOT) / "config"
+    return examples_dir, config_dir
 
 
 def test_normal_pipeline(examples_dir):
@@ -80,21 +81,22 @@ def test_normal_pipeline(examples_dir):
     print("\n[OK][OK] 测试一通过: 正常发布全链路 [OK][OK]")
 
 
-def test_failure_pipeline(examples_dir):
-    """测试二: 失败链路 - 包名重复、空包名、审批被阻塞"""
-    separator("测试二: 失败链路（包名重复等）")
+def test_failure_pipeline(examples_dir, config_dir):
+    """测试二: 失败链路 - check 阶段错误、审批被阻塞、驳回"""
+    separator("测试二: 失败链路（check 阶段错误 + 审批阻塞 + 驳回）")
 
-    mid = f"{examples_dir}/manifest_with_errors.json"
-    rc = run_cli("import", mid, "--id", "test-error-01", "--name", "测试-错误清单")
-    assert rc == 0, "import 失败"
+    mid = f"{examples_dir}/manifest_check_stage_errors.json"
+    rules_path = f"{config_dir}/rules_test_checksum_error.yaml"
+    rc = run_cli("import", mid, "--id", "test-error-01", "--name", "测试-check阶段错误")
+    assert rc == 0, "import 失败（清单无重复包名，应通过预检）"
 
-    rc = run_cli("check", "test-error-01")
-    assert rc == 2, f"check 应返回退出码 2 (有错误)，实际 {rc}"
+    rc = run_cli("check", "test-error-01", "--rules", rules_path)
+    assert rc == 2, f"check 应返回退出码 2 (有 error)，实际 {rc}"
 
     rc = run_cli("approve", "test-error-01", "--approver", "tester2", "--comment", "不应通过")
     assert rc != 0, "存在未解决失败项时 approve 应被拒绝"
 
-    rc = run_cli("reject", "test-error-01", "--approver", "tester2", "--comment", "清单有重复包名，需修复")
+    rc = run_cli("reject", "test-error-01", "--approver", "tester2", "--comment", "缺少校验和，需补充后重新发布")
     assert rc == 0, "reject 失败"
 
     storage = Storage(TEST_DB)
@@ -105,15 +107,13 @@ def test_failure_pipeline(examples_dir):
     approvals = storage.get_approvals("test-error-01")
     assert len(approvals) == 1
     assert approvals[0]["decision"] == "reject"
-    assert "重复包名" in approvals[0]["comment"]
+    assert "校验和" in approvals[0]["comment"]
     print("[OK] 驳回审批记录已落盘")
 
     checks = storage.get_check_results("test-error-01")
-    dup_errors = [c for c in checks if c["rule_id"] == "duplicate_package_name" and c["severity"] == "error"]
-    print(f"[OK] 包名重复检测到 {len(dup_errors)} 条记录（每个重复条目都有明确的项级错误）")
-    for c in dup_errors:
-        print(f"    - item_id={c['item_id']}, msg={c['message'][:60]}...")
-    assert len(dup_errors) >= 4, "每个重复条目都应有对应的项级错误"
+    cs_errors = [c for c in checks if c["rule_id"] == "checksum_required" and c["severity"] == "error"]
+    print(f"[OK] checksum_required 检测到 {len(cs_errors)} 条 error 记录（check 阶段正常工作）")
+    assert len(cs_errors) >= 3, "3 个缺少 checksum 的条目应有对应错误"
 
     print("\n[OK][OK] 测试二通过: 失败链路完整 [OK][OK]")
 
@@ -160,7 +160,7 @@ def test_revoke_and_publish_again():
     print("\n[OK][OK] 测试三通过: 撤销回退与重新发布 [OK][OK]")
 
 
-def test_resume_pipeline(examples_dir):
+def test_resume_pipeline(examples_dir, config_dir):
     """测试四: 按批次续跑"""
     separator("测试四: 按批次续跑（resume 从 created 一键到 published）")
 
@@ -189,10 +189,11 @@ def test_resume_pipeline(examples_dir):
     print(f"[OK] resume 一键完成 check→approve→publish，审批人和发布人均已落盘")
 
     # 测试续跑 check_failed 会中断
-    mid2 = f"{examples_dir}/manifest_with_errors.json"
+    mid2 = f"{examples_dir}/manifest_check_stage_errors.json"
+    rules_path = f"{config_dir}/rules_test_checksum_error.yaml"
     rc = run_cli("import", mid2, "--id", "test-resume-02", "--name", "测试-续跑失败中断")
-    assert rc == 0, "import 失败"
-    rc = run_cli("resume", "test-resume-02", "--to", "approve", "--approver", "tester")
+    assert rc == 0, "import 失败（清单无重复，应通过预检）"
+    rc = run_cli("resume", "test-resume-02", "--to", "approve", "--approver", "tester", "--rules", rules_path)
     assert rc == 2, "有未解决错误时 resume 到 approve 应中断"
     st = storage.get_current_status("test-resume-02")
     assert st.value == "check_failed", f"续跑中断后状态应为 check_failed，实际 {st}"
@@ -338,17 +339,120 @@ def test_illegal_transitions(examples_dir):
     print("\n[OK][OK] 测试七通过: 非法状态流转全部被拦截 [OK][OK]")
 
 
+def test_import_prevalidation_no_residue(examples_dir):
+    """回归测试 1: 错误清单导入失败且数据库里没有新批次、没有残留检查结果/发布记录"""
+    separator("回归测试 1: import 预检失败无任何数据残留")
+
+    storage = Storage(TEST_DB)
+    batches_before = storage.list_batches()
+    count_before = len(batches_before)
+    print(f"[INFO] 测试前数据库已有 {count_before} 个批次")
+
+    mid = f"{examples_dir}/manifest_with_errors.json"
+    rc = run_cli("import", mid, "--id", "should-not-exist-01", "--name", "不应存在的批次")
+    assert rc == 2, f"预检失败应返回退出码 2，实际 {rc}"
+    print("[OK] import 预检失败，退出码 = 2（正确）")
+
+    rc_list = run_cli("list")
+    print(f"[INFO] list 命令返回码: {rc_list}")
+
+    storage2 = Storage(TEST_DB)
+    batches_after = storage2.list_batches()
+    count_after = len(batches_after)
+    print(f"[INFO] 测试后数据库有 {count_after} 个批次")
+
+    batch_ids_after = {b["id"] for b in batches_after}
+    assert "should-not-exist-01" not in batch_ids_after, "预检失败的批次 ID 不应存在于数据库"
+    assert count_after == count_before, f"批次数量不应变化，之前 {count_before}，之后 {count_after}"
+    print("[OK] 数据库批次数量未变，没有新批次残留")
+
+    import sqlite3
+    conn = sqlite3.connect(TEST_DB)
+    cur = conn.cursor()
+    tables = ["batches", "manifest_items", "check_results", "approvals", "publish_records", "status_history"]
+    for tbl in tables:
+        if tbl == "batches":
+            cur.execute(f"SELECT COUNT(*) FROM {tbl} WHERE id = 'should-not-exist-01'")
+        else:
+            cur.execute(f"SELECT COUNT(*) FROM {tbl} WHERE batch_id = 'should-not-exist-01'")
+        cnt = cur.fetchone()[0]
+        assert cnt == 0, f"表 {tbl} 中不应有批次 should-not-exist-01 的数据，实际有 {cnt} 条"
+    conn.close()
+    print("[OK] 所有表中均无残留批次数据 (batches/items/checks/approvals/publish/history)")
+
+    print("\n[OK][OK] 回归测试 1 通过: 预检失败无任何残留 [OK][OK]")
+
+
+def test_import_prevalidation_no_pollution(examples_dir):
+    """回归测试 2: 已有正常发布数据不受 import 预检失败污染"""
+    separator("回归测试 2: import 预检失败不污染已有正常发布数据")
+
+    storage = Storage(TEST_DB)
+    mid = f"{examples_dir}/manifest_good.json"
+    rc = run_cli("import", mid, "--id", "preserve-01", "--name", "保护批次")
+    assert rc == 0, "保护批次 import 失败"
+    rc = run_cli("check", "preserve-01")
+    assert rc == 0, "保护批次 check 失败"
+    rc = run_cli("approve", "preserve-01", "--approver", "guardian", "--comment", "保护数据完整性")
+    assert rc == 0, "保护批次 approve 失败"
+    rc = run_cli("publish", "preserve-01", "--operator", "publisher", "--comment", "正式发布")
+    assert rc == 0, "保护批次 publish 失败"
+    print("[OK] 保护批次已创建并发布完成")
+
+    batch_before = storage.get_batch("preserve-01")
+    checks_before = storage.get_check_results("preserve-01")
+    approvals_before = storage.get_approvals("preserve-01")
+    publish_before = storage.get_publish_records("preserve-01")
+    assert batch_before is not None
+    assert len(approvals_before) == 1
+    assert len(publish_before) == 1
+    print("[OK] 保护数据快照已记录")
+
+    print("\n[INFO] 现在尝试 import 错误清单（预检失败）...")
+    mid_err = f"{examples_dir}/manifest_with_errors.json"
+    rc = run_cli("import", mid_err, "--id", "intruder-01", "--name", "入侵者")
+    assert rc == 2, "预检失败应返回退出码 2"
+    print("[OK] 错误清单预检失败，符合预期")
+
+    storage2 = Storage(TEST_DB)
+    batch_after = storage2.get_batch("preserve-01")
+    checks_after = storage2.get_check_results("preserve-01")
+    approvals_after = storage2.get_approvals("preserve-01")
+    publish_after = storage2.get_publish_records("preserve-01")
+    intruder = storage2.get_batch("intruder-01")
+
+    assert intruder is None, "入侵者批次不应存在"
+    assert batch_after is not None
+    assert batch_after["status"] == "published"
+    assert len(approvals_after) == 1
+    assert approvals_after[0]["approver"] == "guardian"
+    assert approvals_after[0]["decision"] == "approve"
+    assert len(publish_after) == 1
+    assert publish_after[0]["operator"] == "publisher"
+    assert len(checks_after) == len(checks_before)
+    print("[OK] 保护批次的所有数据完整未变：")
+    print(f"    - 状态: {batch_after['status']}")
+    print(f"    - 审批人: {approvals_after[0]['approver']}")
+    print(f"    - 发布人: {publish_after[0]['operator']}")
+    print(f"    - 检查结果数: {len(checks_after)}")
+    print(f"    - 入侵者批次: 不存在（正确）")
+
+    print("\n[OK][OK] 回归测试 2 通过: 已有正常发布数据未受污染 [OK][OK]")
+
+
 def main():
-    examples_dir = cleanup()
+    examples_dir, config_dir = cleanup()
     all_passed = True
     tests = [
         ("正常发布全链路", lambda: test_normal_pipeline(examples_dir)),
-        ("失败链路", lambda: test_failure_pipeline(examples_dir)),
+        ("失败链路", lambda: test_failure_pipeline(examples_dir, config_dir)),
         ("撤销回退与重新发布", test_revoke_and_publish_again),
-        ("按批次续跑", lambda: test_resume_pipeline(examples_dir)),
+        ("按批次续跑", lambda: test_resume_pipeline(examples_dir, config_dir)),
         ("持久化验证", lambda: test_persistence(examples_dir)),
         ("history/status/list", test_status_history_and_list),
         ("非法状态流转拦截", lambda: test_illegal_transitions(examples_dir)),
+        ("回归-预检失败无残留", lambda: test_import_prevalidation_no_residue(examples_dir)),
+        ("回归-正常数据不被污染", lambda: test_import_prevalidation_no_pollution(examples_dir)),
     ]
     results = []
     for name, fn in tests:

@@ -1,7 +1,8 @@
 import hashlib
 import json
 import os
-from typing import Any, Dict, List, Tuple
+from collections import defaultdict
+from typing import Any, Dict, List, Tuple, Optional
 
 import yaml
 
@@ -71,3 +72,60 @@ def _normalize_manifest(data: Any) -> List[Dict[str, Any]]:
                 item["metadata"][k] = v
         normalized.append(item)
     return normalized
+
+
+class ManifestValidationError(Exception):
+    """清单预检失败的业务异常"""
+    def __init__(self, message: str, errors: List[Dict[str, Any]]):
+        super().__init__(message)
+        self.errors = errors
+
+
+def validate_manifest_import(items: List[Dict[str, Any]]) -> Optional[ManifestValidationError]:
+    """
+    清单导入前的纯内存预检。检查：
+    1. 空 package_name（必填）
+    2. 重复 package_name（同批次唯一）
+    发现问题返回 ManifestValidationError，无问题返回 None。
+    不操作数据库，不产生任何副作用。
+    """
+    errors: List[Dict[str, Any]] = []
+    name_indexes: Dict[str, List[int]] = defaultdict(list)
+
+    for idx, item in enumerate(items):
+        pkg_name = (item.get("package_name") or "").strip()
+        line = idx + 1
+        if not pkg_name:
+            errors.append({
+                "type": "empty_package_name",
+                "line": line,
+                "message": f"第 {line} 行缺少 package_name 或为空",
+            })
+        else:
+            name_indexes[pkg_name].append(idx)
+
+    for pkg_name, indexes in name_indexes.items():
+        if len(indexes) > 1:
+            lines = [i + 1 for i in indexes]
+            dup_versions = [items[i].get("version") for i in indexes]
+            for idx in indexes:
+                line = idx + 1
+                errors.append({
+                    "type": "duplicate_package_name",
+                    "line": line,
+                    "package_name": pkg_name,
+                    "duplicate_lines": lines,
+                    "duplicate_versions": dup_versions,
+                    "duplicate_count": len(indexes),
+                    "message": (
+                        f"第 {line} 行包名 '{pkg_name}' 重复，"
+                        f"同时出现在第 {lines} 行 (共 {len(indexes)} 处)"
+                    ),
+                })
+
+    if errors:
+        return ManifestValidationError(
+            f"清单预检失败，共 {len(errors)} 项错误",
+            errors=errors,
+        )
+    return None

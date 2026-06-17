@@ -1,0 +1,26 @@
+{
+  "batch_description": "测试清单 - 能通过 import 预检，但在 check 阶段会触发 error",
+  "items": [
+    {
+      "package_name": "service-alpha",
+      "version": "1.2.0",
+      "source_path": "./artifacts/alpha-1.2.0.tar.gz"
+    },
+    {
+      "package_name": "service-beta",
+      "version": "2.0.1",
+      "source_path": "./artifacts/beta-2.0.1.tar.gz"
+    },
+    {
+      "package_name": "service-gamma",
+      "version": "3.5.0",
+      "source_path": "./artifacts/gamma-3.5.0.tar.gz"
+    },
+    {
+      "package_name": "service-delta",
+      "version": "not-semver",
+      "source_path": "./artifacts/delta.tar.gz",
+      "checksum": "valid-checksum-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+    }
+  ]
+}

@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from tabulate import tabulate
 
-from .manifest import load_manifest
+from .manifest import load_manifest, validate_manifest_import, ManifestValidationError
 from .models import (
     ApprovalDecision,
     BatchStatus,
@@ -146,6 +146,11 @@ def cmd_import(args, storage: Storage) -> int:
         print("错误: 清单为空，至少需要一个条目", file=sys.stderr)
         return 1
 
+    validation_err = validate_manifest_import(items)
+    if validation_err is not None:
+        _print_import_validation_errors(validation_err)
+        return 2
+
     batch_id = args.id or f"batch-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6]}"
     name = args.name or os.path.basename(manifest_path)
     description = args.desc
@@ -167,6 +172,43 @@ def cmd_import(args, storage: Storage) -> int:
     print("下一步建议:")
     print(f"  patchgate check {batch_id}")
     return 0
+
+
+def _print_import_validation_errors(err: ManifestValidationError) -> None:
+    print("[FAIL] 清单预检失败，拒绝导入", file=sys.stderr)
+    print(f"  共发现 {len(err.errors)} 项错误:", file=sys.stderr)
+    print(file=sys.stderr)
+
+    rows = []
+    for e in err.errors:
+        if e["type"] == "duplicate_package_name":
+            rows.append([
+                f"#{e['line']}",
+                e.get("package_name", ""),
+                "包名重复",
+                f"同时出现在第 {e['duplicate_lines']} 行 (共 {e['duplicate_count']} 处, 版本: {e['duplicate_versions']})",
+            ])
+        elif e["type"] == "empty_package_name":
+            rows.append([
+                f"#{e['line']}",
+                "(空)",
+                "包名必填",
+                "package_name 字段缺失或为空",
+            ])
+        else:
+            rows.append([
+                f"#{e['line']}",
+                "",
+                e["type"],
+                e["message"],
+            ])
+    print(
+        tabulate(rows, headers=["行号", "包名", "错误类型", "详细信息"],
+                 tablefmt="grid", maxcolwidths=[6, 20, 12, 80]),
+        file=sys.stderr,
+    )
+    print(file=sys.stderr)
+    print("修复清单后请重新执行 import 命令", file=sys.stderr)
 
 
 def cmd_check(args, storage: Storage) -> int:
