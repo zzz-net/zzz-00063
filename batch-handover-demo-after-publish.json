@@ -1,0 +1,445 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-06-18T06:07:07",
+  "generated_by": "B_exporter",
+  "note": "已发布，C 接手监控",
+  "package_hash": "0ab5dd702f8fb63a717cedd61eae0e39e270f1ad30818d740bd05e2a59623dce",
+  "batch": {
+    "id": "batch-handover-demo",
+    "name": "接手包演示批次",
+    "description": null,
+    "manifest_path": "D:\\workSpace\\AI__SPACE\\zzz-00063\\examples\\manifest_good.json",
+    "manifest_hash": "aa2fbfa9d4ad2e65",
+    "status": "published",
+    "created_at": "2026-06-18T06:06:45",
+    "updated_at": "2026-06-18T06:07:05",
+    "item_count": 5,
+    "items": [
+      {
+        "index": 0,
+        "package_name": "auth-service",
+        "version": "2.4.1",
+        "source_path": "./artifacts/auth-service-2.4.1.tar.gz",
+        "checksum": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+        "metadata": {
+          "priority": "critical",
+          "change_type": "security_patch",
+          "jira_ticket": "SEC-1024"
+        }
+      },
+      {
+        "index": 1,
+        "package_name": "order-service",
+        "version": "3.1.0",
+        "source_path": "./artifacts/order-service-3.1.0.tar.gz",
+        "checksum": "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3",
+        "metadata": {
+          "priority": "high",
+          "change_type": "feature",
+          "jira_ticket": "ORD-5678"
+        }
+      },
+      {
+        "index": 2,
+        "package_name": "payment-gateway",
+        "version": "1.9.3",
+        "source_path": "./artifacts/payment-gateway-1.9.3.tar.gz",
+        "checksum": "c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4",
+        "metadata": {
+          "priority": "high",
+          "change_type": "bugfix",
+          "jira_ticket": "PAY-3321"
+        }
+      },
+      {
+        "index": 3,
+        "package_name": "user-profile",
+        "version": "5.0.2",
+        "source_path": "./artifacts/user-profile-5.0.2.tar.gz",
+        "checksum": "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5",
+        "metadata": {
+          "priority": "medium",
+          "change_type": "bugfix",
+          "jira_ticket": "USR-9012"
+        }
+      },
+      {
+        "index": 4,
+        "package_name": "notification-hub",
+        "version": "4.2.0",
+        "source_path": "./artifacts/notification-hub-4.2.0.tar.gz",
+        "checksum": "e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6",
+        "metadata": {
+          "priority": "low",
+          "change_type": "enhancement",
+          "jira_ticket": "NOT-1122"
+        }
+      }
+    ]
+  },
+  "latest_validation": {
+    "has_error": false,
+    "total_checks": 5,
+    "passed": 0,
+    "failed": 5,
+    "warnings": 5,
+    "errors": 0,
+    "skipped": 0,
+    "failures": [
+      {
+        "package_name": "auth-service",
+        "item_index": 0,
+        "rule_id": "source_path_exists",
+        "rule_name": "源路径存在性检查",
+        "severity": "warning",
+        "message": "源路径不存在: ./artifacts/auth-service-2.4.1.tar.gz",
+        "details": {
+          "source_path": "./artifacts/auth-service-2.4.1.tar.gz",
+          "package_name": "auth-service"
+        }
+      },
+      {
+        "package_name": "order-service",
+        "item_index": 1,
+        "rule_id": "source_path_exists",
+        "rule_name": "源路径存在性检查",
+        "severity": "warning",
+        "message": "源路径不存在: ./artifacts/order-service-3.1.0.tar.gz",
+        "details": {
+          "source_path": "./artifacts/order-service-3.1.0.tar.gz",
+          "package_name": "order-service"
+        }
+      },
+      {
+        "package_name": "payment-gateway",
+        "item_index": 2,
+        "rule_id": "source_path_exists",
+        "rule_name": "源路径存在性检查",
+        "severity": "warning",
+        "message": "源路径不存在: ./artifacts/payment-gateway-1.9.3.tar.gz",
+        "details": {
+          "source_path": "./artifacts/payment-gateway-1.9.3.tar.gz",
+          "package_name": "payment-gateway"
+        }
+      },
+      {
+        "package_name": "user-profile",
+        "item_index": 3,
+        "rule_id": "source_path_exists",
+        "rule_name": "源路径存在性检查",
+        "severity": "warning",
+        "message": "源路径不存在: ./artifacts/user-profile-5.0.2.tar.gz",
+        "details": {
+          "source_path": "./artifacts/user-profile-5.0.2.tar.gz",
+          "package_name": "user-profile"
+        }
+      },
+      {
+        "package_name": "notification-hub",
+        "item_index": 4,
+        "rule_id": "source_path_exists",
+        "rule_name": "源路径存在性检查",
+        "severity": "warning",
+        "message": "源路径不存在: ./artifacts/notification-hub-4.2.0.tar.gz",
+        "details": {
+          "source_path": "./artifacts/notification-hub-4.2.0.tar.gz",
+          "package_name": "notification-hub"
+        }
+      }
+    ]
+  },
+  "approval_conclusion": {
+    "latest_decision": "approve",
+    "latest_approver": "A_approver",
+    "latest_comment": "A 审批通过",
+    "latest_at": "2026-06-18T06:06:45",
+    "all_approvals": [
+      {
+        "approver": "A_approver",
+        "decision": "approve",
+        "comment": "A 审批通过",
+        "created_at": "2026-06-18T06:06:45"
+      }
+    ]
+  },
+  "rule_snapshots": {
+    "active": {
+      "id": 1,
+      "snapshot_name": "snapshot-1",
+      "is_active": true,
+      "rules_config_path": "D:\\workSpace\\AI__SPACE\\zzz-00063\\config\\rules.yaml",
+      "rules_sha256": "836669fc1f38e215e5b4258b1e0a86624f074b186c9149d1a5f9a0071f1e8f34",
+      "rules_yaml": "rules:\n  - id: duplicate_package_name\n    name: \"包名唯一性检查\"\n    enabled: true\n    severity: error\n    description: \"同一批次中不得出现重复的包名\"\n    scope: batch\n\n  - id: package_name_required\n    name: \"包名必填检查\"\n    enabled: true\n    severity: error\n    description: \"每个清单条目必须包含非空 package_name\"\n    scope: item\n\n  - id: version_format\n    name: \"版本号格式检查\"\n    enabled: true\n    severity: warning\n    description: \"版本号应符合语义化版本 x.y.z 格式\"\n    scope: item\n    params:\n      pattern: '^\\d+\\.\\d+\\.\\d+(?:[-+][0-9A-Za-z.-]+)?$'\n\n  - id: checksum_required\n    name: \"校验和必填检查\"\n    enabled: false\n    severity: warning\n    description: \"发布包应包含 checksum 校验和\"\n    scope: item\n\n  - id: source_path_exists\n    name: \"源路径存在性检查\"\n    enabled: true\n    severity: warning\n    description: \"检查 source_path 在文件系统中是否存在\"\n    scope: item\n\n  - id: batch_size_limit\n    name: \"批次规模限制\"\n    enabled: false\n    severity: error\n    description: \"单次发布批次不能超过最大包数量\"\n    scope: batch\n    params:\n      max_items: 100\n",
+      "rule_count": 6,
+      "enabled_rule_count": 4,
+      "summary": [
+        {
+          "id": "duplicate_package_name",
+          "name": "包名唯一性检查",
+          "enabled": true,
+          "severity": "error",
+          "scope": "batch",
+          "description": "同一批次中不得出现重复的包名",
+          "params": {}
+        },
+        {
+          "id": "package_name_required",
+          "name": "包名必填检查",
+          "enabled": true,
+          "severity": "error",
+          "scope": "item",
+          "description": "每个清单条目必须包含非空 package_name",
+          "params": {}
+        },
+        {
+          "id": "version_format",
+          "name": "版本号格式检查",
+          "enabled": true,
+          "severity": "warning",
+          "scope": "item",
+          "description": "版本号应符合语义化版本 x.y.z 格式",
+          "params": {
+            "pattern": "^\\d+\\.\\d+\\.\\d+(?:[-+][0-9A-Za-z.-]+)?$"
+          }
+        },
+        {
+          "id": "checksum_required",
+          "name": "校验和必填检查",
+          "enabled": false,
+          "severity": "warning",
+          "scope": "item",
+          "description": "发布包应包含 checksum 校验和",
+          "params": {}
+        },
+        {
+          "id": "source_path_exists",
+          "name": "源路径存在性检查",
+          "enabled": true,
+          "severity": "warning",
+          "scope": "item",
+          "description": "检查 source_path 在文件系统中是否存在",
+          "params": {}
+        },
+        {
+          "id": "batch_size_limit",
+          "name": "批次规模限制",
+          "enabled": false,
+          "severity": "error",
+          "scope": "batch",
+          "description": "单次发布批次不能超过最大包数量",
+          "params": {
+            "max_items": 100
+          }
+        }
+      ],
+      "operator": "system",
+      "reason": "首次 check 自动创建规则快照",
+      "created_at": "2026-06-18T06:06:45",
+      "superseded_by": null
+    },
+    "all": [
+      {
+        "id": 1,
+        "snapshot_name": "snapshot-1",
+        "is_active": true,
+        "rules_config_path": "D:\\workSpace\\AI__SPACE\\zzz-00063\\config\\rules.yaml",
+        "rules_sha256": "836669fc1f38e215e5b4258b1e0a86624f074b186c9149d1a5f9a0071f1e8f34",
+        "rules_yaml": "rules:\n  - id: duplicate_package_name\n    name: \"包名唯一性检查\"\n    enabled: true\n    severity: error\n    description: \"同一批次中不得出现重复的包名\"\n    scope: batch\n\n  - id: package_name_required\n    name: \"包名必填检查\"\n    enabled: true\n    severity: error\n    description: \"每个清单条目必须包含非空 package_name\"\n    scope: item\n\n  - id: version_format\n    name: \"版本号格式检查\"\n    enabled: true\n    severity: warning\n    description: \"版本号应符合语义化版本 x.y.z 格式\"\n    scope: item\n    params:\n      pattern: '^\\d+\\.\\d+\\.\\d+(?:[-+][0-9A-Za-z.-]+)?$'\n\n  - id: checksum_required\n    name: \"校验和必填检查\"\n    enabled: false\n    severity: warning\n    description: \"发布包应包含 checksum 校验和\"\n    scope: item\n\n  - id: source_path_exists\n    name: \"源路径存在性检查\"\n    enabled: true\n    severity: warning\n    description: \"检查 source_path 在文件系统中是否存在\"\n    scope: item\n\n  - id: batch_size_limit\n    name: \"批次规模限制\"\n    enabled: false\n    severity: error\n    description: \"单次发布批次不能超过最大包数量\"\n    scope: batch\n    params:\n      max_items: 100\n",
+        "rule_count": 6,
+        "enabled_rule_count": 4,
+        "summary": [
+          {
+            "id": "duplicate_package_name",
+            "name": "包名唯一性检查",
+            "enabled": true,
+            "severity": "error",
+            "scope": "batch",
+            "description": "同一批次中不得出现重复的包名",
+            "params": {}
+          },
+          {
+            "id": "package_name_required",
+            "name": "包名必填检查",
+            "enabled": true,
+            "severity": "error",
+            "scope": "item",
+            "description": "每个清单条目必须包含非空 package_name",
+            "params": {}
+          },
+          {
+            "id": "version_format",
+            "name": "版本号格式检查",
+            "enabled": true,
+            "severity": "warning",
+            "scope": "item",
+            "description": "版本号应符合语义化版本 x.y.z 格式",
+            "params": {
+              "pattern": "^\\d+\\.\\d+\\.\\d+(?:[-+][0-9A-Za-z.-]+)?$"
+            }
+          },
+          {
+            "id": "checksum_required",
+            "name": "校验和必填检查",
+            "enabled": false,
+            "severity": "warning",
+            "scope": "item",
+            "description": "发布包应包含 checksum 校验和",
+            "params": {}
+          },
+          {
+            "id": "source_path_exists",
+            "name": "源路径存在性检查",
+            "enabled": true,
+            "severity": "warning",
+            "scope": "item",
+            "description": "检查 source_path 在文件系统中是否存在",
+            "params": {}
+          },
+          {
+            "id": "batch_size_limit",
+            "name": "批次规模限制",
+            "enabled": false,
+            "severity": "error",
+            "scope": "batch",
+            "description": "单次发布批次不能超过最大包数量",
+            "params": {
+              "max_items": 100
+            }
+          }
+        ],
+        "operator": "system",
+        "reason": "首次 check 自动创建规则快照",
+        "created_at": "2026-06-18T06:06:45",
+        "superseded_by": null
+      }
+    ],
+    "decisions": []
+  },
+  "todo_actions": [
+    {
+      "priority": "info",
+      "action": "review",
+      "description": "已发布，可查看历史或撤销",
+      "command": "patchgate history batch-handover-demo"
+    },
+    {
+      "priority": "low",
+      "action": "revoke",
+      "description": "如发现问题可撤销发布",
+      "command": "patchgate revoke batch-handover-demo --operator <姓名> --comment <原因>"
+    },
+    {
+      "priority": "info",
+      "action": "view_status",
+      "description": "查看完整状态详情",
+      "command": "patchgate status batch-handover-demo"
+    },
+    {
+      "priority": "info",
+      "action": "view_history",
+      "description": "查看完整历史记录",
+      "command": "patchgate history batch-handover-demo"
+    }
+  ],
+  "log_index": {
+    "status_transitions": 8,
+    "approvals": 1,
+    "publish_records": 1,
+    "snapshot_decisions": 0,
+    "latest_entries": {
+      "status": {
+        "id": 8,
+        "batch_id": "batch-handover-demo",
+        "from_status": "approved",
+        "to_status": "published",
+        "operator": "B_operator",
+        "note": "B 发布完成",
+        "created_at": "2026-06-18T06:07:05"
+      },
+      "approval": {
+        "id": 1,
+        "batch_id": "batch-handover-demo",
+        "approver": "A_approver",
+        "decision": "approve",
+        "comment": "A 审批通过",
+        "created_at": "2026-06-18T06:06:45"
+      },
+      "publish": {
+        "id": 1,
+        "batch_id": "batch-handover-demo",
+        "operator": "B_operator",
+        "action": "publish",
+        "comment": "B 发布完成",
+        "created_at": "2026-06-18T06:07:05"
+      },
+      "snapshot_decision": null
+    }
+  },
+  "publish_history": [
+    {
+      "operator": "B_operator",
+      "action": "publish",
+      "comment": "B 发布完成",
+      "created_at": "2026-06-18T06:07:05"
+    }
+  ],
+  "status_history": [
+    {
+      "from_status": null,
+      "to_status": "created",
+      "operator": "system",
+      "note": "batch created",
+      "created_at": "2026-06-18T06:06:45"
+    },
+    {
+      "from_status": "created",
+      "to_status": "approved",
+      "operator": "handover-import",
+      "note": "从接手包导入，设置状态为 approved",
+      "created_at": "2026-06-18T06:06:45"
+    },
+    {
+      "from_status": null,
+      "to_status": "created",
+      "operator": "system",
+      "note": "batch created",
+      "created_at": "2026-06-18T06:06:24"
+    },
+    {
+      "from_status": "created",
+      "to_status": "checking",
+      "operator": "system",
+      "note": "开始规则校验 (规则快照 #1)",
+      "created_at": "2026-06-18T06:06:25"
+    },
+    {
+      "from_status": "checking",
+      "to_status": "check_passed",
+      "operator": "system",
+      "note": "校验通过: 11 项通过, 5 个警告 (规则快照 #1)",
+      "created_at": "2026-06-18T06:06:26"
+    },
+    {
+      "from_status": "check_passed",
+      "to_status": "approved",
+      "operator": "A_approver",
+      "note": "A 审批通过",
+      "created_at": "2026-06-18T06:06:27"
+    },
+    {
+      "from_status": null,
+      "to_status": "approved",
+      "operator": "handover-import",
+      "note": "从接手包导入 (import_id=1, 原 ID=batch-handover-demo)",
+      "created_at": "2026-06-18T06:06:46"
+    },
+    {
+      "from_status": "approved",
+      "to_status": "published",
+      "operator": "B_operator",
+      "note": "B 发布完成",
+      "created_at": "2026-06-18T06:07:05"
+    }
+  ],
+  "revoke_context": null
+}

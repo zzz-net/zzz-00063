@@ -16,6 +16,15 @@ from .models import (
 )
 from .rules import RuleEngine, create_engine_from_snapshot, diff_rules, check_default_rules_vs_snapshot, get_default_rules_path
 from .storage import DEFAULT_DB_PATH, Storage
+from .handover import (
+    build_handover_package,
+    export_handover_to_file,
+    load_handover_from_file,
+    validate_handover_package,
+    detect_import_conflicts,
+    import_handover_package,
+    HANDOVER_SCHEMA_VERSION,
+)
 
 
 STATUS_COLORS = {
@@ -142,6 +151,38 @@ def _make_parser() -> argparse.ArgumentParser:
 
     # list
     p_list = sub.add_parser("list", help="列出所有批次")
+
+    # handover-export
+    p_hexp = sub.add_parser("handover-export", help="导出接手包（完整项目状态快照）")
+    p_hexp.add_argument("batch_id", type=str, help="批次 ID")
+    p_hexp.add_argument("--output", "-o", type=str, default=None, help="输出文件路径（默认 stdout）")
+    p_hexp.add_argument("--exporter", "-e", type=str, default="unknown", help="导出人姓名/标识")
+    p_hexp.add_argument("--note", "-n", type=str, default=None, help="交接备注")
+
+    # handover-import
+    p_himp = sub.add_parser("handover-import", help="导入接手包恢复项目状态")
+    p_himp.add_argument("package", type=str, help="接手包 JSON 文件路径")
+    p_himp.add_argument("--by", "-b", type=str, default="unknown", help="导入人姓名/标识")
+    p_himp.add_argument("--note", "-n", type=str, default=None, help="导入备注")
+    p_himp.add_argument(
+        "--resolve", "-r", type=str, action="append", default=None,
+        help="冲突解决方案，格式: 冲突类型=解决方案，可多次指定。冲突类型: duplicate_id/newer_local/rules_changed/rules_missing/duplicate_import"
+    )
+    p_himp.add_argument(
+        "--default-keep-local", action="store_true",
+        help="所有冲突默认保留本地版本"
+    )
+    p_himp.add_argument(
+        "--default-keep-package", action="store_true",
+        help="所有冲突默认采用导入包版本"
+    )
+    p_himp.add_argument(
+        "--dry-run", action="store_true",
+        help="仅检测冲突，不实际导入"
+    )
+
+    # handover-list
+    p_hlist = sub.add_parser("handover-list", help="列出所有接手包导入记录")
 
     return parser
 
@@ -808,6 +849,24 @@ def cmd_export(args, storage: Storage) -> int:
             "restore_note": revoke_ctx.get("restore_note"),
         }
 
+    handover_imports = storage.get_handover_imports_for_batch(args.batch_id)
+    if handover_imports:
+        summary["handover_imports"] = [
+            {
+                "id": hi["id"],
+                "original_batch_id": hi.get("original_batch_id"),
+                "package_hash": hi["package_hash"],
+                "package_generated_at": hi["package_generated_at"],
+                "package_generated_by": hi.get("package_generated_by"),
+                "package_note": hi.get("package_note"),
+                "imported_by": hi.get("imported_by"),
+                "imported_at": hi["imported_at"],
+                "import_note": hi.get("import_note"),
+                "resolution_summary": json.loads(hi["resolution_summary"]) if hi.get("resolution_summary") else None,
+            }
+            for hi in handover_imports
+        ]
+
     fmt = args.format
     if fmt == "json":
         content = json.dumps(summary, ensure_ascii=False, indent=2)
@@ -977,6 +1036,25 @@ def _to_markdown(s: Dict[str, Any]) -> str:
                 f"{sd.get('diff_summary') or '-'} | "
                 f"{(sd.get('risk_level') or '-').upper()} | "
                 f"{note} | {sd['at']} |"
+            )
+        lines.append("")
+
+    if s.get("handover_imports"):
+        lines.append("## 接手包导入记录")
+        lines.append("")
+        lines.append("| # | 原批次 ID | 导出人 | 导入人 | 导入时间 | 冲突处理 |")
+        lines.append("|---|-----------|--------|--------|----------|----------|")
+        for hi in s["handover_imports"]:
+            resolutions = []
+            if hi.get("resolution_summary"):
+                resolutions = [f"{r['conflict_type']}={r['resolution']}" for r in hi["resolution_summary"]]
+            res_text = ", ".join(resolutions) if resolutions else "-"
+            res_text = res_text.replace("|", "\\|")
+            lines.append(
+                f"| {hi['id']} | {hi.get('original_batch_id') or '-'} | "
+                f"{hi.get('package_generated_by') or '-'} | "
+                f"{hi.get('imported_by') or '-'} | "
+                f"{hi['imported_at']} | {res_text} |"
             )
         lines.append("")
 
@@ -1397,6 +1475,34 @@ def cmd_history(args, storage: Storage) -> int:
             ))
             print()
 
+    handover_imports = storage.get_handover_imports_for_batch(args.batch_id)
+    if handover_imports and hist_type in ("all", "status"):
+        print("── 接手包导入记录 ──")
+        rows = []
+        for imp in handover_imports:
+            resolutions = []
+            if imp.get("resolution_summary"):
+                try:
+                    res_list = json.loads(imp["resolution_summary"])
+                    resolutions = [f"{r['conflict_type']}={r['resolution']}" for r in res_list]
+                except json.JSONDecodeError:
+                    pass
+            rows.append([
+                imp["id"],
+                imp.get("original_batch_id") or "-",
+                imp.get("package_generated_by") or "unknown",
+                imp.get("imported_by") or "unknown",
+                ", ".join(resolutions) if resolutions else "-",
+                imp["imported_at"],
+            ])
+        print(tabulate(
+            rows,
+            headers=["#", "原批次 ID", "导出人", "导入人", "冲突处理", "导入时间"],
+            tablefmt="simple",
+            maxcolwidths=[6, 20, 10, 10, 40, 20],
+        ))
+        print()
+
     checks = storage.get_check_results(args.batch_id, CheckResultStatus.FAILED)
     if checks and hist_type == "all":
         print("── 未解决失败项 ──")
@@ -1423,6 +1529,32 @@ def cmd_status(args, storage: Storage) -> int:
     print(f"  创建时间   : {batch['created_at']}")
     print(f"  更新时间   : {batch['updated_at']}")
     print()
+
+    handover_imports = storage.get_handover_imports_for_batch(args.batch_id)
+    if handover_imports:
+        print("══ 接手来源 ══")
+        for imp in handover_imports:
+            print(f"  导入记录 #{imp['id']}:")
+            print(f"    原批次 ID : {imp.get('original_batch_id') or '-'}")
+            print(f"    包哈希    : {imp['package_hash'][:16]}...")
+            print(f"    导出人    : {imp.get('package_generated_by') or 'unknown'}")
+            print(f"    导出时间  : {imp['package_generated_at']}")
+            if imp.get("package_note"):
+                print(f"    导出备注  : {imp['package_note']}")
+            print(f"    导入人    : {imp.get('imported_by') or 'unknown'}")
+            print(f"    导入时间  : {imp['imported_at']}")
+            if imp.get("import_note"):
+                print(f"    导入备注  : {imp['import_note']}")
+            if imp.get("resolution_summary"):
+                try:
+                    resolutions = json.loads(imp["resolution_summary"])
+                    if resolutions:
+                        print(f"    冲突处理  : {len(resolutions)} 项")
+                        for r in resolutions:
+                            print(f"      - {r['conflict_type']}: {r['resolution']}")
+                except json.JSONDecodeError:
+                    pass
+        print()
 
     active_snapshot = storage.get_active_rule_snapshot(args.batch_id)
     if active_snapshot:
@@ -1664,6 +1796,255 @@ def cmd_list(args, storage: Storage) -> int:
     return 0
 
 
+def cmd_handover_export(args, storage: Storage) -> int:
+    batch = storage.get_batch(args.batch_id)
+    if not batch:
+        print(f"错误: 批次 {args.batch_id} 不存在", file=sys.stderr)
+        return 1
+
+    print(f"[>] 导出接手包: {args.batch_id}")
+    print(f"  导出人: {args.exporter}")
+    if args.note:
+        print(f"  交接备注: {args.note}")
+    print()
+
+    package = build_handover_package(storage, args.batch_id, args.exporter, args.note)
+
+    print("══ 接手包内容摘要 ══")
+    print(f"  Schema 版本: {package['schema_version']}")
+    print(f"  生成时间: {package['generated_at']}")
+    print(f"  包哈希: {package['package_hash'][:16]}...")
+    print()
+    print(f"  批次 ID: {package['batch']['id']}")
+    print(f"  批次名称: {package['batch']['name']}")
+    print(f"  当前状态: {colorize(package['batch']['status'], BatchStatus(package['batch']['status']))}")
+    print(f"  条目数量: {package['batch']['item_count']}")
+    print()
+    print(f"  最近校验: {'有错误' if package['latest_validation']['has_error'] else '通过'} "
+          f"(检查 {package['latest_validation']['total_checks']} 项, "
+          f"通过 {package['latest_validation']['passed']}, "
+          f"失败 {package['latest_validation']['failed']})")
+    if package["approval_conclusion"]["latest_decision"]:
+        print(f"  审批结论: {package['approval_conclusion']['latest_decision']} "
+              f"(by {package['approval_conclusion']['latest_approver']})")
+    print()
+    print(f"  待办动作: {len(package['todo_actions'])} 项")
+    for todo in package["todo_actions"][:3]:
+        priority_tag = {"high": "[!]", "medium": "[-]", "low": "[·]", "info": "[i]"}.get(todo["priority"], "[?]")
+        print(f"    {priority_tag} {todo['description']}")
+        if todo.get("command"):
+            print(f"       $ {todo['command']}")
+    if len(package["todo_actions"]) > 3:
+        print(f"    ... 还有 {len(package['todo_actions']) - 3} 项")
+    print()
+
+    if args.output:
+        output_path = export_handover_to_file(storage, args.batch_id, args.output, args.exporter, args.note)
+        print(f"[OK] 接手包已导出到: {os.path.abspath(output_path)}")
+        print()
+        print("  移交提示: 将此 JSON 文件发送给接手人，对方执行:")
+        print(f"    $ patchgate handover-import {os.path.basename(output_path)} --by <接手人姓名>")
+    else:
+        print(json.dumps(package, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_handover_import(args, storage: Storage) -> int:
+    pkg_path = os.path.abspath(args.package)
+    if not os.path.exists(pkg_path):
+        print(f"错误: 接手包文件不存在: {pkg_path}", file=sys.stderr)
+        return 1
+
+    print(f"[>] 导入接手包: {pkg_path}")
+    print(f"  导入人: {args.by}")
+    if args.note:
+        print(f"  导入备注: {args.note}")
+    print()
+
+    package = load_handover_from_file(pkg_path)
+
+    is_valid, errors = validate_handover_package(package)
+    if not is_valid:
+        print("[FAIL] 接手包验证失败:", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        return 1
+
+    print("[OK] 接手包格式验证通过")
+    print(f"  包哈希: {package['package_hash'][:16]}...")
+    print(f"  生成时间: {package['generated_at']}")
+    print(f"  导出人: {package.get('generated_by', 'unknown')}")
+    print(f"  批次 ID: {package['batch']['id']}")
+    print(f"  批次名称: {package['batch']['name']}")
+    print(f"  批次状态: {colorize(package['batch']['status'], BatchStatus(package['batch']['status']))}")
+    print()
+
+    conflicts = detect_import_conflicts(storage, package)
+
+    if conflicts:
+        print(f"[!] 检测到 {len(conflicts)} 个冲突:")
+        print()
+        for i, c in enumerate(conflicts, 1):
+            sev_tag = {"high": "[严重]", "medium": "[中等]", "low": "[轻微]"}.get(c["severity"], "[?]")
+            print(f"  {i}. {sev_tag} {c['description']} (type: {c['type']})")
+            print(f"     可用选项: {', '.join(c['resolution_options'])}")
+            if c["type"] == "duplicate_id" or c["type"] == "newer_local":
+                d = c["details"]
+                print(f"     本地: {d['local_status']} @ {d['local_updated_at']}")
+                print(f"     包内: {d['package_status']} @ {d['package_updated_at']}")
+            elif c["type"] == "rules_changed":
+                d = c["details"]
+                print(f"     差异: {d['diff_summary']} (风险: {d['risk_level'].upper()})")
+                print(f"     规则文件: {d['rules_path']}")
+            elif c["type"] == "rules_missing":
+                d = c["details"]
+                print(f"     缺失文件: {d['rules_path']}")
+            elif c["type"] == "duplicate_import":
+                d = c["details"]
+                print(f"     上次导入: {d['previous_import_at']} by {d['previous_imported_by']}")
+            print()
+
+        if args.dry_run:
+            print("[i] --dry-run 模式，仅检测冲突，不执行导入")
+            print("  使用 --resolve 冲突类型=解决方案 来指定处理方式")
+            print("  或使用 --default-keep-local / --default-keep-package 批量指定")
+            return 0
+
+        resolutions = {}
+        if args.resolve:
+            for r in args.resolve:
+                if "=" not in r:
+                    print(f"错误: --resolve 格式错误，应为 '冲突类型=解决方案': {r}", file=sys.stderr)
+                    return 1
+                ctype, rvalue = r.split("=", 1)
+                resolutions[ctype.strip()] = rvalue.strip()
+
+        if args.default_keep_local or args.default_keep_package:
+            for c in conflicts:
+                if c["type"] not in resolutions:
+                    if args.default_keep_local:
+                        if "keep_local" in c["resolution_options"]:
+                            resolutions[c["type"]] = "keep_local"
+                        elif c["type"] == "rules_changed":
+                            resolutions[c["type"]] = "switch_to_local_rules"
+                        elif c["type"] == "duplicate_import":
+                            resolutions[c["type"]] = "skip"
+                    else:
+                        if "overwrite_with_package" in c["resolution_options"]:
+                            resolutions[c["type"]] = "overwrite_with_package"
+                        elif c["type"] == "rules_changed":
+                            resolutions[c["type"]] = "keep_package_snapshot"
+                        elif c["type"] == "rules_missing":
+                            resolutions[c["type"]] = "use_package_snapshot"
+                        elif c["type"] == "duplicate_import":
+                            resolutions[c["type"]] = "force_reimport"
+                        elif c["type"] == "duplicate_id":
+                            resolutions[c["type"]] = "rename_package"
+
+        unresolved = [c["type"] for c in conflicts if c["type"] not in resolutions]
+        if unresolved:
+            print("[FAIL] 以下冲突未提供解决方案:", file=sys.stderr)
+            for c in unresolved:
+                conflict = next(x for x in conflicts if x["type"] == c)
+                print(f"  - {c}: 可用选项 {', '.join(conflict['resolution_options'])}", file=sys.stderr)
+            print(file=sys.stderr)
+            print("  使用 --resolve 冲突类型=解决方案 逐个指定，", file=sys.stderr)
+            print("  或使用 --default-keep-local / --default-keep-package 批量处理", file=sys.stderr)
+            return 1
+
+        print("[>] 冲突解决方案:")
+        for c in conflicts:
+            print(f"  - {c['type']}: {resolutions[c['type']]}")
+        print()
+
+        if any(v == "keep_local" or v == "skip" for v in resolutions.values()):
+            print("[i] 部分冲突选择保留本地/跳过，将不覆盖现有数据")
+            print()
+    else:
+        print("[OK] 无冲突")
+        print()
+        resolutions = {}
+
+    if args.dry_run:
+        print("[i] --dry-run 模式，不执行实际导入")
+        return 0
+
+    try:
+        result = import_handover_package(
+            storage=storage,
+            package=package,
+            resolutions=resolutions,
+            imported_by=args.by,
+            import_note=args.note,
+        )
+    except ValueError as e:
+        print(f"[FAIL] 导入失败: {e}", file=sys.stderr)
+        return 1
+
+    if result["action"] == "skipped":
+        print(f"[OK] {result['reason']}")
+        return 0
+
+    print("[OK] 接手包导入成功")
+    print(f"  新批次 ID: {result['batch_id']}")
+    if result.get("original_batch_id") != result["batch_id"]:
+        print(f"  原批次 ID: {result['original_batch_id']}")
+    print(f"  导入记录 ID: #{result['import_id']}")
+    print()
+
+    if result.get("resolution_summary"):
+        print("══ 冲突处理记录 ══")
+        for r in result["resolution_summary"]:
+            print(f"  - {r['conflict_type']}: {r['resolution']}")
+        print()
+
+    batch = storage.get_batch(result["batch_id"])
+    st = BatchStatus(batch["status"])
+    print(f"  当前状态: {colorize(st.value, st)}")
+    print()
+
+    print("══ 接手人待办 ══")
+    todos = package["todo_actions"]
+    for todo in todos:
+        if todo["priority"] in ("high", "medium"):
+            priority_tag = {"high": "[!]", "medium": "[-]"}.get(todo["priority"], "[?]")
+            cmd = todo.get("command", "").replace(package["batch"]["id"], result["batch_id"])
+            print(f"  {priority_tag} {todo['description']}")
+            if cmd:
+                print(f"     $ {cmd}")
+    print()
+    print(f"  查看完整状态:  patchgate status {result['batch_id']}")
+    print(f"  查看导入记录:  patchgate history {result['batch_id']}")
+    print()
+    _print_next_steps(st, result["batch_id"], storage)
+    return 0
+
+
+def cmd_handover_list(args, storage: Storage) -> int:
+    imports = storage.get_all_handover_imports()
+    if not imports:
+        print("(暂无接手包导入记录)")
+        return 0
+
+    rows = []
+    for imp in imports:
+        rows.append([
+            imp["id"],
+            imp["batch_id"],
+            imp.get("original_batch_id") or "-",
+            imp.get("imported_by") or "unknown",
+            imp["imported_at"],
+            imp.get("package_generated_by") or "unknown",
+        ])
+    print(tabulate(
+        rows,
+        headers=["#", "批次 ID", "原 ID", "导入人", "导入时间", "导出人"],
+        tablefmt="grid",
+        maxcolwidths=[6, 24, 24, 12, 20, 12],
+    ))
+    return 0
+
+
 COMMAND_HANDLERS = {
     "import": cmd_import,
     "check": cmd_check,
@@ -1676,6 +2057,9 @@ COMMAND_HANDLERS = {
     "history": cmd_history,
     "status": cmd_status,
     "list": cmd_list,
+    "handover-export": cmd_handover_export,
+    "handover-import": cmd_handover_import,
+    "handover-list": cmd_handover_list,
 }
 
 

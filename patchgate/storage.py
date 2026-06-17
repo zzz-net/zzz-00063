@@ -19,7 +19,9 @@ DEFAULT_DB_PATH = os.path.join(os.getcwd(), ".patchgate", "patchgate.db")
 class Storage:
     def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path or DEFAULT_DB_PATH
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        dir_path = os.path.dirname(self.db_path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
         self._init_db()
 
     @contextmanager
@@ -150,8 +152,30 @@ class Storage:
                 );
                 CREATE INDEX IF NOT EXISTS idx_rule_snapshots_batch ON rule_snapshots(batch_id);
                 CREATE INDEX IF NOT EXISTS idx_rule_snapshots_active ON rule_snapshots(batch_id, is_active);
+
+                CREATE TABLE IF NOT EXISTS handover_imports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id TEXT NOT NULL,
+                    original_batch_id TEXT,
+                    package_hash TEXT NOT NULL,
+                    package_generated_at TEXT NOT NULL,
+                    package_generated_by TEXT,
+                    package_note TEXT,
+                    imported_at TEXT NOT NULL,
+                    imported_by TEXT,
+                    import_note TEXT,
+                    resolution_summary TEXT,
+                    FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_handover_imports_batch ON handover_imports(batch_id);
+                CREATE INDEX IF NOT EXISTS idx_handover_imports_hash ON handover_imports(package_hash);
                 """
             )
+        with self._conn() as conn:
+            try:
+                conn.execute("ALTER TABLE handover_imports ADD COLUMN package_note TEXT")
+            except Exception:
+                pass
 
     def _now(self) -> str:
         return datetime.now().isoformat(timespec="seconds")
@@ -586,3 +610,112 @@ class Storage:
                 revoke_info["restore_note"] = dict(approved_row).get("note")
 
             return revoke_info
+
+    def delete_batch(self, batch_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM batches WHERE id = ?", (batch_id,))
+
+    def force_set_status(
+        self,
+        batch_id: str,
+        target: BatchStatus,
+        operator: str = "system",
+        note: str = "",
+    ) -> None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT status FROM batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+            if not row:
+                raise ValueError(f"批次 {batch_id} 不存在")
+            current = BatchStatus(row["status"])
+            now = self._now()
+            conn.execute(
+                "UPDATE batches SET status = ?, updated_at = ? WHERE id = ?",
+                (target.value, now, batch_id),
+            )
+            conn.execute(
+                """INSERT INTO status_history
+                   (batch_id, from_status, to_status, operator, note, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (batch_id, current.value, target.value, operator, note, now),
+            )
+
+    def add_status_history_entry(
+        self,
+        batch_id: str,
+        from_status: Optional[str],
+        to_status: str,
+        operator: str = "system",
+        note: str = "",
+        created_at: Optional[str] = None,
+    ) -> int:
+        now = created_at or self._now()
+        with self._conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO status_history
+                   (batch_id, from_status, to_status, operator, note, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (batch_id, from_status, to_status, operator, note, now),
+            )
+            return cur.lastrowid
+
+    def add_handover_import_record(
+        self,
+        batch_id: str,
+        package_hash: str,
+        package_generated_at: str,
+        package_generated_by: str,
+        imported_by: str,
+        import_note: Optional[str],
+        resolution_summary: str,
+        original_batch_id: Optional[str] = None,
+        package_note: Optional[str] = None,
+    ) -> int:
+        now = self._now()
+        with self._conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO handover_imports
+                   (batch_id, original_batch_id, package_hash, package_generated_at,
+                    package_generated_by, package_note, imported_at, imported_by, import_note,
+                    resolution_summary)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    batch_id,
+                    original_batch_id,
+                    package_hash,
+                    package_generated_at,
+                    package_generated_by,
+                    package_note,
+                    now,
+                    imported_by,
+                    import_note,
+                    resolution_summary,
+                ),
+            )
+            return cur.lastrowid
+
+    def get_handover_import_by_hash(self, package_hash: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM handover_imports WHERE package_hash = ? ORDER BY id DESC LIMIT 1",
+                (package_hash,),
+            ).fetchone()
+            if not row:
+                return None
+            return dict(row)
+
+    def get_handover_imports_for_batch(self, batch_id: str) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM handover_imports WHERE batch_id = ? ORDER BY id",
+                (batch_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_all_handover_imports(self) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM handover_imports ORDER BY id DESC"
+            ).fetchall()
+            return [dict(r) for r in rows]
