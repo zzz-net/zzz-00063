@@ -1,5 +1,7 @@
+import hashlib
 import os
 import re
+import tempfile
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional
 
@@ -127,6 +129,35 @@ class RuleEngine:
             "has_error": has_error,
             "results": results,
         }
+
+    def get_rules_sha256(self) -> str:
+        with open(self.rules_config_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    def get_rules_yaml_content(self) -> str:
+        with open(self.rules_config_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def get_summary(self) -> List[Dict[str, Any]]:
+        summary = []
+        for rule in self.rules:
+            summary.append({
+                "id": rule["id"],
+                "name": rule["name"],
+                "enabled": rule.get("enabled", True),
+                "severity": rule.get("severity", "warning"),
+                "scope": rule.get("scope", "item"),
+                "description": rule.get("description", ""),
+                "params": rule.get("params", {}),
+            })
+        return summary
+
+    def get_total_rule_count(self) -> int:
+        return len(self.rules)
+
+    def get_enabled_rule_count(self) -> int:
+        return len(self.get_enabled_rules())
 
 
 def _mk_result(
@@ -351,3 +382,103 @@ def _check_batch_size_limit(
             details={"count": count, "max_items": max_items},
         )
     ]
+
+
+def create_engine_from_snapshot(snapshot: Dict[str, Any]) -> RuleEngine:
+    rules_yaml = snapshot["rules_yaml"]
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", delete=False, encoding="utf-8"
+    )
+    try:
+        tmp.write(rules_yaml)
+        tmp.close()
+        engine = RuleEngine(tmp.name)
+        return engine
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+def diff_rules(engine_a: RuleEngine, engine_b: RuleEngine) -> Dict[str, Any]:
+    rules_a = {r["id"]: r for r in engine_a.rules}
+    rules_b = {r["id"]: r for r in engine_b.rules}
+
+    added = []
+    removed = []
+    changed = []
+
+    for rid in rules_b:
+        if rid not in rules_a:
+            added.append(rules_b[rid])
+
+    for rid in rules_a:
+        if rid not in rules_b:
+            removed.append(rules_a[rid])
+
+    for rid in rules_a:
+        if rid in rules_b:
+            a = rules_a[rid]
+            b = rules_b[rid]
+            changes = []
+            for key in ("enabled", "severity", "scope", "description"):
+                if a.get(key) != b.get(key):
+                    changes.append({
+                        "field": key,
+                        "old": a.get(key),
+                        "new": b.get(key),
+                    })
+            params_a = a.get("params", {})
+            params_b = b.get("params", {})
+            all_params = set(params_a.keys()) | set(params_b.keys())
+            param_changes = []
+            for pk in all_params:
+                if params_a.get(pk) != params_b.get(pk):
+                    param_changes.append({
+                        "param": pk,
+                        "old": params_a.get(pk),
+                        "new": params_b.get(pk),
+                    })
+            if param_changes:
+                changes.append({
+                    "field": "params",
+                    "changes": param_changes,
+                })
+            if changes:
+                changed.append({
+                    "id": rid,
+                    "name": b.get("name", a.get("name", rid)),
+                    "changes": changes,
+                })
+
+    is_identical = not added and not removed and not changed
+    severity_changed = any(
+        c.get("field") == "severity"
+        for chg in changed
+        for c in chg.get("changes", [])
+    )
+    enabled_changed = any(
+        c.get("field") == "enabled"
+        for chg in changed
+        for c in chg.get("changes", [])
+    ) or added or removed
+
+    risk_level = "low"
+    if severity_changed or enabled_changed:
+        risk_level = "high"
+    elif changed:
+        risk_level = "medium"
+
+    return {
+        "is_identical": is_identical,
+        "added": [{"id": r["id"], "name": r["name"]} for r in added],
+        "removed": [{"id": r["id"], "name": r["name"]} for r in removed],
+        "changed": changed,
+        "risk_level": risk_level,
+        "summary": (
+            f"新增 {len(added)} 条规则，"
+            f"删除 {len(removed)} 条规则，"
+            f"修改 {len(changed)} 条规则"
+        ),
+    }

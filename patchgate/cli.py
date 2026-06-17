@@ -14,7 +14,7 @@ from .models import (
     BatchStatus,
     CheckResultStatus,
 )
-from .rules import RuleEngine
+from .rules import RuleEngine, create_engine_from_snapshot, diff_rules
 from .storage import DEFAULT_DB_PATH, Storage
 
 
@@ -67,6 +67,10 @@ def _make_parser() -> argparse.ArgumentParser:
     p_check.add_argument(
         "--continue-on-error", action="store_true", help="存在失败项时仍允许后续操作"
     )
+    p_check.add_argument(
+        "--force", "-f", action="store_true",
+        help="强制使用指定规则并创建新快照（当规则与当前快照不同时需用此参数确认）"
+    )
 
     # approve
     p_approve = sub.add_parser("approve", help="审批通过批次")
@@ -118,13 +122,17 @@ def _make_parser() -> argparse.ArgumentParser:
     )
     p_resume.add_argument("--approver", "-a", type=str, default=None, help="自动审批时的审批人")
     p_resume.add_argument("--operator", "-o", type=str, default=None, help="自动发布时的操作人")
+    p_resume.add_argument(
+        "--force", "-f", action="store_true",
+        help="强制使用指定规则并创建新快照（当规则与当前快照不同时需用此参数确认）"
+    )
 
     # history
-    p_hist = sub.add_parser("history", help="查看批次历史（状态/审批/发布）")
+    p_hist = sub.add_parser("history", help="查看批次历史（状态/审批/发布/规则快照）")
     p_hist.add_argument("batch_id", type=str, nargs="?", default=None, help="批次 ID (留空查看所有批次)")
     p_hist.add_argument(
         "--type", "-t", type=str,
-        choices=["all", "status", "approval", "publish"],
+        choices=["all", "status", "approval", "publish", "rules"],
         default="all", help="历史类型 (默认 all)",
     )
 
@@ -222,10 +230,114 @@ def cmd_check(args, storage: Storage) -> int:
         print(f"错误: 批次已发布，不能再执行校验。如需修改请先 revoke", file=sys.stderr)
         return 1
 
+    active_snapshot = storage.get_active_rule_snapshot(args.batch_id)
+    force_new_snapshot = getattr(args, "force_rules", False) or getattr(args, "force", False)
+
+    if args.rules:
+        new_engine = RuleEngine(args.rules)
+        new_sha = new_engine.get_rules_sha256()
+
+        if active_snapshot:
+            if active_snapshot["rules_sha256"] == new_sha:
+                engine = new_engine
+                print(f"[i] 指定的规则文件与当前活动快照一致 (SHA256: {new_sha[:16]}...)")
+            else:
+                snapshot_engine = create_engine_from_snapshot(active_snapshot)
+                diff = diff_rules(snapshot_engine, new_engine)
+                print(f"[!] 检测到规则变更：{diff['summary']}")
+                print(f"    风险等级: {diff['risk_level'].upper()}")
+                print(f"    原快照: #{active_snapshot['id']} ({active_snapshot['snapshot_name']})")
+                print(f"    新文件: {args.rules}")
+                if diff["added"]:
+                    print(f"    新增规则:")
+                    for r in diff["added"]:
+                        print(f"      + {r['id']}: {r['name']}")
+                if diff["removed"]:
+                    print(f"    删除规则:")
+                    for r in diff["removed"]:
+                        print(f"      - {r['id']}: {r['name']}")
+                if diff["changed"]:
+                    print(f"    修改规则:")
+                    for r in diff["changed"]:
+                        print(f"      ~ {r['id']}: {r['name']}")
+                        for c in r["changes"]:
+                            if c["field"] == "params":
+                                for pc in c["changes"]:
+                                    print(f"          params.{pc['param']}: {pc['old']} -> {pc['new']}")
+                            else:
+                                print(f"          {c['field']}: {c['old']} -> {c['new']}")
+
+                if not force_new_snapshot:
+                    print()
+                    print("[!] 规则变更可能影响校验结果的可追溯性。")
+                    print("    如需确认使用新规则并创建新快照，请添加 --force 参数。")
+                    return 1
+
+                print()
+                print("[>] 使用新规则并创建新快照...")
+                engine = new_engine
+                snapshot_name = f"snapshot-{len(storage.get_rule_snapshots(args.batch_id)) + 1}"
+                new_snap_id = storage.add_rule_snapshot(
+                    batch_id=args.batch_id,
+                    snapshot_name=snapshot_name,
+                    rules_config_path=os.path.abspath(args.rules),
+                    rules_sha256=new_sha,
+                    rules_yaml=new_engine.get_rules_yaml_content(),
+                    rule_count=new_engine.get_total_rule_count(),
+                    enabled_rule_count=new_engine.get_enabled_rule_count(),
+                    summary=new_engine.get_summary(),
+                    operator="user",
+                    reason=f"手动指定规则文件: {args.rules}",
+                )
+                storage.supersede_rule_snapshot(
+                    args.batch_id, active_snapshot["id"], new_snap_id, "user",
+                    f"被新快照 #{new_snap_id} 替代"
+                )
+                print(f"[OK] 已创建新规则快照 #{new_snap_id} ({snapshot_name})")
+                print(f"    旧快照 #{active_snapshot['id']} 已标记为被覆盖")
+        else:
+            engine = new_engine
+            snapshot_name = "snapshot-1"
+            snap_id = storage.add_rule_snapshot(
+                batch_id=args.batch_id,
+                snapshot_name=snapshot_name,
+                rules_config_path=os.path.abspath(args.rules),
+                rules_sha256=new_sha,
+                rules_yaml=new_engine.get_rules_yaml_content(),
+                rule_count=new_engine.get_total_rule_count(),
+                enabled_rule_count=new_engine.get_enabled_rule_count(),
+                summary=new_engine.get_summary(),
+                operator="user",
+                reason=f"初始规则快照: {args.rules}",
+            )
+            print(f"[OK] 已创建初始规则快照 #{snap_id} ({snapshot_name})")
+    else:
+        if active_snapshot:
+            engine = create_engine_from_snapshot(active_snapshot)
+            print(f"[i] 沿用当前活动规则快照 #{active_snapshot['id']} ({active_snapshot['snapshot_name']})")
+            print(f"    来源: {active_snapshot['rules_config_path']}")
+            print(f"    SHA256: {active_snapshot['rules_sha256'][:16]}...")
+            print(f"    创建时间: {active_snapshot['created_at']}")
+        else:
+            engine = RuleEngine()
+            snapshot_name = "snapshot-1"
+            snap_id = storage.add_rule_snapshot(
+                batch_id=args.batch_id,
+                snapshot_name=snapshot_name,
+                rules_config_path=os.path.abspath(engine.rules_config_path),
+                rules_sha256=engine.get_rules_sha256(),
+                rules_yaml=engine.get_rules_yaml_content(),
+                rule_count=engine.get_total_rule_count(),
+                enabled_rule_count=engine.get_enabled_rule_count(),
+                summary=engine.get_summary(),
+                operator="system",
+                reason="首次 check 自动创建规则快照",
+            )
+            print(f"[OK] 已创建初始规则快照 #{snap_id} ({snapshot_name})")
+
     storage.transition_status(args.batch_id, BatchStatus.CHECKING, "system", "开始规则校验")
     print(f"[>] 开始校验批次 {args.batch_id} ...")
 
-    engine = RuleEngine(args.rules)
     enabled = engine.get_enabled_rules()
     print(f"  启用规则数: {len(enabled)}")
     for r in enabled:
@@ -476,6 +588,8 @@ def cmd_export(args, storage: Storage) -> int:
     approvals = storage.get_approvals(args.batch_id)
     publish_records = storage.get_publish_records(args.batch_id)
     status_history = storage.get_status_history(args.batch_id)
+    rule_snapshots = storage.get_rule_snapshots(args.batch_id)
+    active_snapshot = storage.get_active_rule_snapshot(args.batch_id)
 
     summary = {
         "batch_id": batch["id"],
@@ -497,6 +611,8 @@ def cmd_export(args, storage: Storage) -> int:
             }
             for it in batch["items"]
         ],
+        "rule_snapshot": None,
+        "rule_snapshots": [],
         "check_summary": {
             "total": len(checks),
             "passed": sum(1 for c in checks if c["status"] == CheckResultStatus.PASSED.value),
@@ -551,6 +667,40 @@ def cmd_export(args, storage: Storage) -> int:
         "exported_at": datetime.now().isoformat(timespec="seconds"),
     }
 
+    if active_snapshot:
+        summary["rule_snapshot"] = {
+            "id": active_snapshot["id"],
+            "name": active_snapshot["snapshot_name"],
+            "is_active": active_snapshot["is_active"],
+            "rules_config_path": active_snapshot["rules_config_path"],
+            "rules_sha256": active_snapshot["rules_sha256"],
+            "rule_count": active_snapshot["rule_count"],
+            "enabled_rule_count": active_snapshot["enabled_rule_count"],
+            "operator": active_snapshot.get("operator"),
+            "reason": active_snapshot.get("reason"),
+            "created_at": active_snapshot["created_at"],
+            "superseded_by": active_snapshot.get("superseded_by"),
+            "rules_summary": active_snapshot["summary"],
+        }
+
+    summary["rule_snapshots"] = [
+        {
+            "id": s["id"],
+            "name": s["snapshot_name"],
+            "is_active": s["is_active"],
+            "rules_config_path": s["rules_config_path"],
+            "rules_sha256": s["rules_sha256"],
+            "rule_count": s["rule_count"],
+            "enabled_rule_count": s["enabled_rule_count"],
+            "operator": s.get("operator"),
+            "reason": s.get("reason"),
+            "created_at": s["created_at"],
+            "superseded_by": s.get("superseded_by"),
+            "rules_summary": s["summary"],
+        }
+        for s in rule_snapshots
+    ]
+
     fmt = args.format
     if fmt == "json":
         content = json.dumps(summary, ensure_ascii=False, indent=2)
@@ -587,6 +737,47 @@ def _to_markdown(s: Dict[str, Any]) -> str:
     if s.get("description"):
         lines.append(f"- **描述**: {s['description']}")
     lines.append("")
+
+    if s.get("rule_snapshot"):
+        rs = s["rule_snapshot"]
+        lines.append("## 规则快照（当前活动）")
+        lines.append("")
+        lines.append(f"- **快照 ID**: #{rs['id']} ({rs['name']})")
+        lines.append(f"- **来源文件**: `{rs['rules_config_path']}`")
+        lines.append(f"- **SHA256**: `{rs['rules_sha256'][:16]}...`")
+        lines.append(f"- **规则总数**: {rs['rule_count']} (启用 {rs['enabled_rule_count']})")
+        lines.append(f"- **创建时间**: {rs['created_at']}")
+        lines.append(f"- **操作人**: {rs.get('operator') or 'system'}")
+        if rs.get("reason"):
+            lines.append(f"- **备注**: {rs['reason']}")
+        lines.append("")
+        lines.append("### 关键校验项")
+        lines.append("")
+        lines.append("| 规则 ID | 规则名称 | 级别 | 状态 | 范围 |")
+        lines.append("|---------|----------|------|------|------|")
+        for rule in rs.get("rules_summary", []):
+            status = "启用" if rule["enabled"] else "禁用"
+            lines.append(
+                f"| {rule['id']} | {rule['name']} | {rule['severity']} | "
+                f"{status} | {rule['scope']} |"
+            )
+        lines.append("")
+
+    if s.get("rule_snapshots") and len(s["rule_snapshots"]) > 1:
+        lines.append("## 规则快照历史")
+        lines.append("")
+        lines.append("| # | 快照名 | 状态 | 操作人 | 规则数 | 启用数 | 创建时间 |")
+        lines.append("|---|--------|------|--------|--------|--------|----------|")
+        for snap in s["rule_snapshots"]:
+            status = "活动" if snap["is_active"] else "已覆盖"
+            lines.append(
+                f"| {snap['id']} | {snap['name']} | {status} | "
+                f"{snap.get('operator') or 'system'} | "
+                f"{snap['rule_count']} | {snap['enabled_rule_count']} | "
+                f"{snap['created_at']} |"
+            )
+        lines.append("")
+
     lines.append("## 清单内容")
     lines.append("")
     lines.append("| # | 包名 | 版本 | 源路径 | 校验和 |")
@@ -659,6 +850,112 @@ def cmd_resume(args, storage: Storage) -> int:
     print(f"  目标阶段: {args.to}")
     print()
 
+    active_snapshot = storage.get_active_rule_snapshot(args.batch_id)
+    force_new_snapshot = getattr(args, "force", False)
+
+    if args.rules:
+        new_engine = RuleEngine(args.rules)
+        new_sha = new_engine.get_rules_sha256()
+
+        if active_snapshot:
+            if active_snapshot["rules_sha256"] == new_sha:
+                engine = new_engine
+                print(f"[i] 指定的规则文件与当前活动快照一致 (SHA256: {new_sha[:16]}...)")
+            else:
+                snapshot_engine = create_engine_from_snapshot(active_snapshot)
+                diff = diff_rules(snapshot_engine, new_engine)
+                print(f"[!] 检测到规则变更：{diff['summary']}")
+                print(f"    风险等级: {diff['risk_level'].upper()}")
+                print(f"    原快照: #{active_snapshot['id']} ({active_snapshot['snapshot_name']})")
+                print(f"    新文件: {args.rules}")
+                if diff["added"]:
+                    print(f"    新增规则:")
+                    for r in diff["added"]:
+                        print(f"      + {r['id']}: {r['name']}")
+                if diff["removed"]:
+                    print(f"    删除规则:")
+                    for r in diff["removed"]:
+                        print(f"      - {r['id']}: {r['name']}")
+                if diff["changed"]:
+                    print(f"    修改规则:")
+                    for r in diff["changed"]:
+                        print(f"      ~ {r['id']}: {r['name']}")
+                        for c in r["changes"]:
+                            if c["field"] == "params":
+                                for pc in c["changes"]:
+                                    print(f"          params.{pc['param']}: {pc['old']} -> {pc['new']}")
+                            else:
+                                print(f"          {c['field']}: {c['old']} -> {c['new']}")
+
+                if not force_new_snapshot:
+                    print()
+                    print("[!] 规则变更可能影响校验结果的可追溯性。")
+                    print("    如需确认使用新规则并创建新快照，请添加 --force 参数。")
+                    return 1
+
+                print()
+                print("[>] 使用新规则并创建新快照...")
+                engine = new_engine
+                snapshot_name = f"snapshot-{len(storage.get_rule_snapshots(args.batch_id)) + 1}"
+                new_snap_id = storage.add_rule_snapshot(
+                    batch_id=args.batch_id,
+                    snapshot_name=snapshot_name,
+                    rules_config_path=os.path.abspath(args.rules),
+                    rules_sha256=new_sha,
+                    rules_yaml=new_engine.get_rules_yaml_content(),
+                    rule_count=new_engine.get_total_rule_count(),
+                    enabled_rule_count=new_engine.get_enabled_rule_count(),
+                    summary=new_engine.get_summary(),
+                    operator="resume",
+                    reason=f"resume 更换规则文件: {args.rules}",
+                )
+                storage.supersede_rule_snapshot(
+                    args.batch_id, active_snapshot["id"], new_snap_id, "resume",
+                    f"被新快照 #{new_snap_id} 替代"
+                )
+                print(f"[OK] 已创建新规则快照 #{new_snap_id} ({snapshot_name})")
+                print(f"    旧快照 #{active_snapshot['id']} 已标记为被覆盖")
+        else:
+            engine = new_engine
+            snapshot_name = "snapshot-1"
+            snap_id = storage.add_rule_snapshot(
+                batch_id=args.batch_id,
+                snapshot_name=snapshot_name,
+                rules_config_path=os.path.abspath(args.rules),
+                rules_sha256=new_sha,
+                rules_yaml=new_engine.get_rules_yaml_content(),
+                rule_count=new_engine.get_total_rule_count(),
+                enabled_rule_count=new_engine.get_enabled_rule_count(),
+                summary=new_engine.get_summary(),
+                operator="resume",
+                reason=f"resume 初始规则快照: {args.rules}",
+            )
+            print(f"[OK] 已创建初始规则快照 #{snap_id} ({snapshot_name})")
+    else:
+        if active_snapshot:
+            engine = create_engine_from_snapshot(active_snapshot)
+            print(f"[i] 沿用当前活动规则快照 #{active_snapshot['id']} ({active_snapshot['snapshot_name']})")
+            print(f"    来源: {active_snapshot['rules_config_path']}")
+            print(f"    SHA256: {active_snapshot['rules_sha256'][:16]}...")
+            print(f"    创建时间: {active_snapshot['created_at']}")
+        else:
+            engine = RuleEngine()
+            snapshot_name = "snapshot-1"
+            snap_id = storage.add_rule_snapshot(
+                batch_id=args.batch_id,
+                snapshot_name=snapshot_name,
+                rules_config_path=os.path.abspath(engine.rules_config_path),
+                rules_sha256=engine.get_rules_sha256(),
+                rules_yaml=engine.get_rules_yaml_content(),
+                rule_count=engine.get_total_rule_count(),
+                enabled_rule_count=engine.get_enabled_rule_count(),
+                summary=engine.get_summary(),
+                operator="resume",
+                reason="resume 自动创建规则快照",
+            )
+            print(f"[OK] 已创建初始规则快照 #{snap_id} ({snapshot_name})")
+    print()
+
     target_to_stage = {
         "check": [BatchStatus.CHECK_PASSED, BatchStatus.CHECK_FAILED],
         "approve": [BatchStatus.APPROVED, BatchStatus.REJECTED],
@@ -677,7 +974,6 @@ def cmd_resume(args, storage: Storage) -> int:
         if stage == "created" or (stage in ("check_failed", "rejected", "revoked", "checking") and to_stage in ("check", "approve", "publish")):
             print("→ 执行规则校验 ...")
             storage.transition_status(args.batch_id, BatchStatus.CHECKING, "resume", "续跑-重新校验")
-            engine = RuleEngine(args.rules)
             result = engine.run_checks(args.batch_id, storage)
             _print_check_report(result, storage, args.batch_id, batch["items"])
             if result["has_error"]:
@@ -815,6 +1111,47 @@ def cmd_history(args, storage: Storage) -> int:
             print("(无)")
         print()
 
+    if hist_type in ("all", "rules"):
+        print("── 规则快照历史 ──")
+        snapshots = storage.get_rule_snapshots(args.batch_id)
+        if snapshots:
+            rows = []
+            for s in snapshots:
+                status_tag = "活动" if s["is_active"] else "已覆盖"
+                sup_by = f"#{s['superseded_by']}" if s.get("superseded_by") else "-"
+                rows.append([
+                    s["id"],
+                    s["snapshot_name"],
+                    status_tag,
+                    sup_by,
+                    s.get("operator") or "system",
+                    s["rule_count"],
+                    s["enabled_rule_count"],
+                    s["created_at"],
+                ])
+            print(tabulate(
+                rows,
+                headers=["#", "快照名", "状态", "被替代", "操作人", "规则数", "启用数", "创建时间"],
+                tablefmt="simple",
+            ))
+            print()
+            print("  快照详情:")
+            for s in snapshots:
+                active_marker = " [活动]" if s["is_active"] else ""
+                print(f"    #{s['id']} {s['snapshot_name']}{active_marker}")
+                print(f"       来源: {s['rules_config_path']}")
+                print(f"       SHA256: {s['rules_sha256'][:16]}...")
+                if s.get("reason"):
+                    print(f"       备注: {s['reason']}")
+                print(f"       关键校验项:")
+                for rule in s["summary"]:
+                    en = "启用" if rule["enabled"] else "禁用"
+                    print(f"         - {rule['id']}: {rule['name']} "
+                          f"[{rule['severity'].upper()}] [{en}]")
+        else:
+            print("(无规则快照，执行 check 后会自动创建)")
+        print()
+
     checks = storage.get_check_results(args.batch_id, CheckResultStatus.FAILED)
     if checks and hist_type == "all":
         print("── 未解决失败项 ──")
@@ -841,6 +1178,32 @@ def cmd_status(args, storage: Storage) -> int:
     print(f"  创建时间   : {batch['created_at']}")
     print(f"  更新时间   : {batch['updated_at']}")
     print()
+
+    active_snapshot = storage.get_active_rule_snapshot(args.batch_id)
+    if active_snapshot:
+        print(f"规则快照 (当前活动): #{active_snapshot['id']} {active_snapshot['snapshot_name']}")
+        print(f"  来源文件   : {active_snapshot['rules_config_path']}")
+        print(f"  SHA256     : {active_snapshot['rules_sha256'][:16]}...")
+        print(f"  规则总数   : {active_snapshot['rule_count']} (启用 {active_snapshot['enabled_rule_count']})")
+        print(f"  创建时间   : {active_snapshot['created_at']}")
+        print(f"  创建人     : {active_snapshot.get('operator') or 'system'}")
+        if active_snapshot.get("reason"):
+            print(f"  备注       : {active_snapshot['reason']}")
+        all_snapshots = storage.get_rule_snapshots(args.batch_id)
+        superseded = [s for s in all_snapshots if not s["is_active"]]
+        if superseded:
+            print(f"  历史快照   : {len(superseded)} 个已被覆盖")
+        print()
+        print(f"  关键校验项:")
+        for rule in active_snapshot["summary"]:
+            status_tag = "启用" if rule["enabled"] else "禁用"
+            print(f"    - {rule['id']}: {rule['name']} "
+                  f"[{rule['severity'].upper()}] [{status_tag}] "
+                  f"({rule['scope']})")
+        print()
+    else:
+        print("规则快照: 尚无 (执行 check 后会自动创建)")
+        print()
 
     checks = storage.get_check_results(args.batch_id)
     if checks:

@@ -112,6 +112,27 @@ class Storage:
                     FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS idx_status_history_batch ON status_history(batch_id);
+
+                CREATE TABLE IF NOT EXISTS rule_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id TEXT NOT NULL,
+                    snapshot_name TEXT NOT NULL,
+                    rules_config_path TEXT NOT NULL,
+                    rules_sha256 TEXT NOT NULL,
+                    rules_yaml TEXT NOT NULL,
+                    rule_count INTEGER NOT NULL,
+                    enabled_rule_count INTEGER NOT NULL,
+                    summary_json TEXT NOT NULL,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    superseded_by INTEGER,
+                    operator TEXT,
+                    reason TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE CASCADE,
+                    FOREIGN KEY (superseded_by) REFERENCES rule_snapshots(id) ON DELETE SET NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_rule_snapshots_batch ON rule_snapshots(batch_id);
+                CREATE INDEX IF NOT EXISTS idx_rule_snapshots_active ON rule_snapshots(batch_id, is_active);
                 """
             )
 
@@ -379,3 +400,108 @@ class Storage:
                 (batch_id, item_index),
             ).fetchone()
             return dict(row) if row else None
+
+    def add_rule_snapshot(
+        self,
+        batch_id: str,
+        snapshot_name: str,
+        rules_config_path: str,
+        rules_sha256: str,
+        rules_yaml: str,
+        rule_count: int,
+        enabled_rule_count: int,
+        summary: List[Dict[str, Any]],
+        operator: str = "system",
+        reason: str = "",
+    ) -> int:
+        now = self._now()
+        with self._conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO rule_snapshots
+                   (batch_id, snapshot_name, rules_config_path, rules_sha256, rules_yaml,
+                    rule_count, enabled_rule_count, summary_json, is_active,
+                    operator, reason, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)""",
+                (
+                    batch_id,
+                    snapshot_name,
+                    rules_config_path,
+                    rules_sha256,
+                    rules_yaml,
+                    rule_count,
+                    enabled_rule_count,
+                    json.dumps(summary, ensure_ascii=False),
+                    operator,
+                    reason,
+                    now,
+                ),
+            )
+            return cur.lastrowid
+
+    def get_active_rule_snapshot(self, batch_id: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM rule_snapshots WHERE batch_id = ? AND is_active = 1 ORDER BY id DESC LIMIT 1",
+                (batch_id,),
+            ).fetchone()
+            if not row:
+                return None
+            snap = dict(row)
+            if snap.get("summary_json"):
+                snap["summary"] = json.loads(snap["summary_json"])
+                del snap["summary_json"]
+            snap["is_active"] = bool(snap["is_active"])
+            return snap
+
+    def get_rule_snapshots(self, batch_id: str) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM rule_snapshots WHERE batch_id = ? ORDER BY id",
+                (batch_id,),
+            ).fetchall()
+            snaps = []
+            for row in rows:
+                snap = dict(row)
+                if snap.get("summary_json"):
+                    snap["summary"] = json.loads(snap["summary_json"])
+                    del snap["summary_json"]
+                snap["is_active"] = bool(snap["is_active"])
+                snaps.append(snap)
+            return snaps
+
+    def get_rule_snapshot_by_id(self, snapshot_id: int) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM rule_snapshots WHERE id = ?",
+                (snapshot_id,),
+            ).fetchone()
+            if not row:
+                return None
+            snap = dict(row)
+            if snap.get("summary_json"):
+                snap["summary"] = json.loads(snap["summary_json"])
+                del snap["summary_json"]
+            snap["is_active"] = bool(snap["is_active"])
+            return snap
+
+    def supersede_rule_snapshot(
+        self,
+        batch_id: str,
+        old_snapshot_id: int,
+        new_snapshot_id: int,
+        operator: str = "system",
+        reason: str = "",
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE rule_snapshots SET is_active = 0, superseded_by = ? WHERE id = ? AND batch_id = ?",
+                (new_snapshot_id, old_snapshot_id, batch_id),
+            )
+
+    def has_rule_snapshot(self, batch_id: str) -> bool:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM rule_snapshots WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            return row["cnt"] > 0
