@@ -1,0 +1,46 @@
+rules:
+  - id: duplicate_package_name
+    name: "包名唯一性检查"
+    enabled: true
+    severity: error
+    description: "同一批次中不得出现重复的包名"
+    scope: batch
+
+  - id: package_name_required
+    name: "包名必填检查"
+    enabled: true
+    severity: error
+    description: "每个清单条目必须包含非空 package_name"
+    scope: item
+
+  - id: version_format
+    name: "版本号格式检查"
+    enabled: true
+    severity: warning
+    description: "版本号应符合语义化版本 x.y.z 格式"
+    scope: item
+    params:
+      pattern: '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$'
+
+  - id: checksum_required
+    name: "校验和必填检查"
+    enabled: false
+    severity: warning
+    description: "发布包应包含 checksum 校验和"
+    scope: item
+
+  - id: source_path_exists
+    name: "源路径存在性检查"
+    enabled: true
+    severity: warning
+    description: "检查 source_path 在文件系统中是否存在"
+    scope: item
+
+  - id: batch_size_limit
+    name: "批次规模限制"
+    enabled: false
+    severity: error
+    description: "单次发布批次不能超过最大包数量"
+    scope: batch
+    params:
+      max_items: 100

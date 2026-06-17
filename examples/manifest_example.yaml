@@ -1,0 +1,13 @@
+batch_description: "YAML 格式清单示例"
+release_window: "2026-06-21 23:00 ~ 01:00"
+items:
+  - package_name: "api-gateway"
+    version: "7.8.2"
+    source_path: "./dist/api-gateway-7.8.2.zip"
+    checksum: "f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7"
+    region: "cn-north-1"
+  - package_name: "data-warehouse"
+    version: "12.3.0"
+    source_path: "./dist/data-warehouse-12.3.0.zip"
+    checksum: "a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8"
+    region: "cn-north-1"
