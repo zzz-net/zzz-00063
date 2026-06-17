@@ -113,6 +113,23 @@ class Storage:
                 );
                 CREATE INDEX IF NOT EXISTS idx_status_history_batch ON status_history(batch_id);
 
+                CREATE TABLE IF NOT EXISTS snapshot_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    old_snapshot_id INTEGER,
+                    new_snapshot_id INTEGER,
+                    diff_summary TEXT,
+                    risk_level TEXT,
+                    operator TEXT,
+                    note TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE CASCADE,
+                    FOREIGN KEY (old_snapshot_id) REFERENCES rule_snapshots(id) ON DELETE SET NULL,
+                    FOREIGN KEY (new_snapshot_id) REFERENCES rule_snapshots(id) ON DELETE SET NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_snapshot_decisions_batch ON snapshot_decisions(batch_id);
+
                 CREATE TABLE IF NOT EXISTS rule_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     batch_id TEXT NOT NULL,
@@ -505,3 +522,67 @@ class Storage:
                 (batch_id,),
             ).fetchone()
             return row["cnt"] > 0
+
+    def add_snapshot_decision(
+        self,
+        batch_id: str,
+        decision: str,
+        old_snapshot_id: Optional[int],
+        new_snapshot_id: Optional[int],
+        diff_summary: Optional[str] = None,
+        risk_level: Optional[str] = None,
+        operator: str = "system",
+        note: Optional[str] = None,
+    ) -> int:
+        now = self._now()
+        with self._conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO snapshot_decisions
+                   (batch_id, decision, old_snapshot_id, new_snapshot_id,
+                    diff_summary, risk_level, operator, note, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (batch_id, decision, old_snapshot_id, new_snapshot_id,
+                 diff_summary, risk_level, operator, note, now),
+            )
+            return cur.lastrowid
+
+    def get_snapshot_decisions(self, batch_id: str) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM snapshot_decisions WHERE batch_id = ? ORDER BY id",
+                (batch_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_last_revoke_context(self, batch_id: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            revoke_row = conn.execute(
+                """SELECT * FROM status_history
+                   WHERE batch_id = ? AND to_status = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (batch_id, BatchStatus.REVOKED.value),
+            ).fetchone()
+            if not revoke_row:
+                return None
+            revoke_info = dict(revoke_row)
+
+            publish_row = conn.execute(
+                """SELECT * FROM publish_records
+                   WHERE batch_id = ? AND action = 'revoke'
+                   ORDER BY id DESC LIMIT 1""",
+                (batch_id,),
+            ).fetchone()
+            if publish_row:
+                revoke_info["revoke_operator"] = dict(publish_row)["operator"]
+                revoke_info["revoke_comment"] = dict(publish_row).get("comment")
+
+            approved_row = conn.execute(
+                """SELECT * FROM status_history
+                   WHERE batch_id = ? AND to_status = ? AND id > ?
+                   ORDER BY id LIMIT 1""",
+                (batch_id, BatchStatus.APPROVED.value, revoke_info["id"]),
+            ).fetchone()
+            if approved_row:
+                revoke_info["restore_note"] = dict(approved_row).get("note")
+
+            return revoke_info

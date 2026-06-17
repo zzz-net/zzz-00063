@@ -270,6 +270,16 @@ def cmd_check(args, storage: Storage) -> int:
                     print()
                     print("[!] 规则变更可能影响校验结果的可追溯性。")
                     print("    如需确认使用新规则并创建新快照，请添加 --force 参数。")
+                    storage.add_snapshot_decision(
+                        batch_id=args.batch_id,
+                        decision="keep_old",
+                        old_snapshot_id=active_snapshot["id"],
+                        new_snapshot_id=None,
+                        diff_summary=diff["summary"],
+                        risk_level=diff["risk_level"],
+                        operator="user",
+                        note=f"用户未确认覆盖，沿用旧快照 #{active_snapshot['id']} (差异: {diff['summary']}, 风险: {diff['risk_level']})",
+                    )
                     return 1
 
                 print()
@@ -293,6 +303,16 @@ def cmd_check(args, storage: Storage) -> int:
                     f"被新快照 #{new_snap_id} 替代"
                 )
                 print(f"[OK] 已创建新规则快照 #{new_snap_id} ({snapshot_name})")
+                storage.add_snapshot_decision(
+                    batch_id=args.batch_id,
+                    decision="override_to_new",
+                    old_snapshot_id=active_snapshot["id"],
+                    new_snapshot_id=new_snap_id,
+                    diff_summary=diff["summary"],
+                    risk_level=diff["risk_level"],
+                    operator="user",
+                    note=f"用户确认覆盖规则快照: #{active_snapshot['id']} → #{new_snap_id}",
+                )
                 print(f"    旧快照 #{active_snapshot['id']} 已标记为被覆盖")
         else:
             engine = new_engine
@@ -329,6 +349,17 @@ def cmd_check(args, storage: Storage) -> int:
                 print(f"      · 继续沿用旧快照（本次默认行为，无需额外参数）")
                 print(f"      · 切换到当前默认规则并创建新快照:  patchgate check {args.batch_id} --rules {consistency['default_rules_path']} --force")
                 print(f"      · 查看快照详情:  patchgate history {args.batch_id} -t rules")
+                storage.add_snapshot_decision(
+                    batch_id=args.batch_id,
+                    decision="keep_old",
+                    old_snapshot_id=active_snapshot["id"],
+                    new_snapshot_id=None,
+                    diff_summary=diff["summary"],
+                    risk_level=diff["risk_level"],
+                    operator="system",
+                    note=f"检测到规则文件变更，沿用旧快照 #{active_snapshot['id']} (差异: {diff['summary']}, 风险: {diff['risk_level']})",
+                )
+                print(f"    [已记录] 本次沿用旧快照的决策已写入历史")
         else:
             engine = RuleEngine()
             snapshot_name = "snapshot-1"
@@ -752,6 +783,31 @@ def cmd_export(args, storage: Storage) -> int:
         for s in rule_snapshots
     ]
 
+    snapshot_decisions = storage.get_snapshot_decisions(args.batch_id)
+    summary["snapshot_decisions"] = [
+        {
+            "id": sd["id"],
+            "decision": sd["decision"],
+            "old_snapshot_id": sd.get("old_snapshot_id"),
+            "new_snapshot_id": sd.get("new_snapshot_id"),
+            "diff_summary": sd.get("diff_summary"),
+            "risk_level": sd.get("risk_level"),
+            "operator": sd.get("operator"),
+            "note": sd.get("note"),
+            "at": sd["created_at"],
+        }
+        for sd in snapshot_decisions
+    ]
+
+    revoke_ctx = storage.get_last_revoke_context(args.batch_id)
+    if revoke_ctx:
+        summary["revoke_context"] = {
+            "revoke_operator": revoke_ctx.get("revoke_operator"),
+            "revoke_comment": revoke_ctx.get("revoke_comment"),
+            "revoke_time": revoke_ctx.get("created_at"),
+            "restore_note": revoke_ctx.get("restore_note"),
+        }
+
     fmt = args.format
     if fmt == "json":
         content = json.dumps(summary, ensure_ascii=False, indent=2)
@@ -890,6 +946,40 @@ def _to_markdown(s: Dict[str, Any]) -> str:
     else:
         lines.append("_暂无发布记录_")
     lines.append("")
+
+    if s.get("revoke_context"):
+        rc = s["revoke_context"]
+        lines.append("## 撤销回退信息")
+        lines.append("")
+        lines.append(f"- **撤销操作人**: {rc.get('revoke_operator') or '-'}")
+        lines.append(f"- **撤销原因**: {rc.get('revoke_comment') or '-'}")
+        lines.append(f"- **撤销时间**: {rc.get('revoke_time') or '-'}")
+        if rc.get("restore_note"):
+            lines.append(f"- **回退说明**: {rc['restore_note']}")
+        lines.append("")
+
+    if s.get("snapshot_decisions"):
+        lines.append("## 规则快照决策记录")
+        lines.append("")
+        lines.append("| # | 决策 | 旧快照 | 新快照 | 差异 | 风险 | 备注 | 时间 |")
+        lines.append("|---|------|--------|--------|------|------|------|------|")
+        for sd in s["snapshot_decisions"]:
+            if sd["decision"] == "keep_old":
+                dec_text = "沿用旧快照"
+            elif sd["decision"] == "override_to_new":
+                dec_text = "覆盖"
+            else:
+                dec_text = sd["decision"]
+            note = (sd.get("note") or "-").replace("|", "\\|")
+            lines.append(
+                f"| {sd['id']} | {dec_text} | #{sd.get('old_snapshot_id') or '-'} | "
+                f"#{sd.get('new_snapshot_id') or '-'} | "
+                f"{sd.get('diff_summary') or '-'} | "
+                f"{(sd.get('risk_level') or '-').upper()} | "
+                f"{note} | {sd['at']} |"
+            )
+        lines.append("")
+
     lines.append("## 状态流转")
     lines.append("")
     lines.append("| 从 | 到 | 操作人 | 备注 | 时间 |")
@@ -955,6 +1045,16 @@ def cmd_resume(args, storage: Storage) -> int:
                     print()
                     print("[!] 规则变更可能影响校验结果的可追溯性。")
                     print("    如需确认使用新规则并创建新快照，请添加 --force 参数。")
+                    storage.add_snapshot_decision(
+                        batch_id=args.batch_id,
+                        decision="keep_old",
+                        old_snapshot_id=active_snapshot["id"],
+                        new_snapshot_id=None,
+                        diff_summary=diff["summary"],
+                        risk_level=diff["risk_level"],
+                        operator="user",
+                        note=f"用户未确认覆盖，沿用旧快照 #{active_snapshot['id']} (差异: {diff['summary']}, 风险: {diff['risk_level']})",
+                    )
                     return 1
 
                 print()
@@ -978,6 +1078,16 @@ def cmd_resume(args, storage: Storage) -> int:
                     f"被新快照 #{new_snap_id} 替代"
                 )
                 print(f"[OK] 已创建新规则快照 #{new_snap_id} ({snapshot_name})")
+                storage.add_snapshot_decision(
+                    batch_id=args.batch_id,
+                    decision="override_to_new",
+                    old_snapshot_id=active_snapshot["id"],
+                    new_snapshot_id=new_snap_id,
+                    diff_summary=diff["summary"],
+                    risk_level=diff["risk_level"],
+                    operator="user",
+                    note=f"用户确认覆盖规则快照: #{active_snapshot['id']} → #{new_snap_id}",
+                )
                 print(f"    旧快照 #{active_snapshot['id']} 已标记为被覆盖")
         else:
             engine = new_engine
@@ -1014,6 +1124,17 @@ def cmd_resume(args, storage: Storage) -> int:
                 print(f"      · 继续沿用旧快照（本次默认行为，无需额外参数）")
                 print(f"      · 切换到当前默认规则并创建新快照:  patchgate resume {args.batch_id} --to {args.to} --rules {consistency['default_rules_path']} --force")
                 print(f"      · 查看快照详情:  patchgate history {args.batch_id} -t rules")
+                storage.add_snapshot_decision(
+                    batch_id=args.batch_id,
+                    decision="keep_old",
+                    old_snapshot_id=active_snapshot["id"],
+                    new_snapshot_id=None,
+                    diff_summary=diff["summary"],
+                    risk_level=diff["risk_level"],
+                    operator="system",
+                    note=f"检测到规则文件变更，沿用旧快照 #{active_snapshot['id']} (差异: {diff['summary']}, 风险: {diff['risk_level']})",
+                )
+                print(f"    [已记录] 本次沿用旧快照的决策已写入历史")
         else:
             engine = RuleEngine()
             snapshot_name = "snapshot-1"
@@ -1248,6 +1369,34 @@ def cmd_history(args, storage: Storage) -> int:
             print("(无规则快照，执行 check 后会自动创建)")
         print()
 
+    if hist_type in ("all", "rules"):
+        snapshot_decs = storage.get_snapshot_decisions(args.batch_id)
+        if snapshot_decs:
+            print("── 规则快照决策记录 ──")
+            rows = []
+            for sd in snapshot_decs:
+                if sd["decision"] == "keep_old":
+                    dec_text = "沿用旧快照"
+                elif sd["decision"] == "override_to_new":
+                    dec_text = f"覆盖 #{sd['old_snapshot_id']}→#{sd['new_snapshot_id']}"
+                else:
+                    dec_text = sd["decision"]
+                rows.append([
+                    sd["id"],
+                    dec_text,
+                    sd.get("diff_summary") or "-",
+                    (sd.get("risk_level") or "-").upper(),
+                    sd.get("operator") or "system",
+                    sd.get("note") or "",
+                    sd["created_at"],
+                ])
+            print(tabulate(
+                rows,
+                headers=["#", "决策", "差异概览", "风险", "操作人", "备注", "时间"],
+                tablefmt="simple",
+            ))
+            print()
+
     checks = storage.get_check_results(args.batch_id, CheckResultStatus.FAILED)
     if checks and hist_type == "all":
         print("── 未解决失败项 ──")
@@ -1341,12 +1490,82 @@ def cmd_status(args, storage: Storage) -> int:
         for p in pubs:
             act = "发布" if p["action"] == "publish" else "撤销回退"
             print(f"  [{act}] {p['operator']} @ {p['created_at']}: {p.get('comment') or '(无)'}")
+        print()
+
+    revoke_ctx = storage.get_last_revoke_context(args.batch_id)
+    if revoke_ctx:
+        print(f"撤销回退信息:")
+        print(f"  撤销操作人 : {revoke_ctx.get('revoke_operator', '-')}")
+        print(f"  撤销原因   : {revoke_ctx.get('revoke_comment', '-')}")
+        print(f"  回退时间   : {revoke_ctx.get('created_at', '-')}")
+        if revoke_ctx.get("restore_note"):
+            print(f"  回退说明   : {revoke_ctx['restore_note']}")
+        print()
+
+    snapshot_decisions = storage.get_snapshot_decisions(args.batch_id)
+    if snapshot_decisions:
+        print(f"规则快照决策记录:")
+        for sd in snapshot_decisions:
+            if sd["decision"] == "keep_old":
+                print(f"  [{sd['created_at']}] 沿用旧快照 #{sd['old_snapshot_id']} "
+                      f"(差异: {sd.get('diff_summary', '-')}, 风险: {sd.get('risk_level', '-').upper()})")
+            elif sd["decision"] == "override_to_new":
+                print(f"  [{sd['created_at']}] 覆盖快照 #{sd['old_snapshot_id']} → #{sd['new_snapshot_id']} "
+                      f"(差异: {sd.get('diff_summary', '-')}, 风险: {sd.get('risk_level', '-').upper()})")
+            if sd.get("note"):
+                print(f"      {sd['note']}")
+        print()
     print()
     _print_next_steps(st, args.batch_id, storage)
     return 0
 
 
 def _print_next_steps(st: BatchStatus, batch_id: Optional[str] = None, storage: Optional[Storage] = None):
+    is_post_revoke = False
+    if batch_id and storage and st == BatchStatus.APPROVED:
+        revoke_ctx = storage.get_last_revoke_context(batch_id)
+        batch = storage.get_batch(batch_id)
+        if revoke_ctx and batch:
+            status_history = storage.get_status_history(batch_id)
+            revoke_idx = None
+            for i, h in enumerate(status_history):
+                if h["to_status"] == BatchStatus.REVOKED.value:
+                    revoke_idx = i
+            if revoke_idx is not None:
+                for h in status_history[revoke_idx + 1:]:
+                    if h["to_status"] == BatchStatus.APPROVED.value:
+                        is_post_revoke = True
+                        break
+
+    if is_post_revoke:
+        approved_info = {
+            "desc": "撤销后回退到审批通过状态 — 可直接重新发布，或修改后重新校验/审批/发布",
+            "steps": [
+                "① 无需修改直接重新发布:                 patchgate publish <BATCH_ID> --operator <姓名>",
+                "② 修改清单后重新校验 (沿用规则快照):       patchgate check <BATCH_ID>",
+                "   然后审批+发布:                       patchgate approve <BATCH_ID> --approver <姓名>",
+                "                                        patchgate publish <BATCH_ID> --operator <姓名>",
+                "③ 一键续跑至发布:                       patchgate resume <BATCH_ID> --to publish --approver <姓名> --operator <姓名>",
+                "④ 确认规则快照与校验依据:                patchgate status <BATCH_ID>",
+                "                                        patchgate history <BATCH_ID> -t rules",
+                "⑤ 如默认规则已变更，显式确认沿用或覆盖:   patchgate check <BATCH_ID>",
+                "   (系统会提示差异，沿用旧快照或用 --force 覆盖)",
+            ],
+        }
+    else:
+        approved_info = {
+            "desc": "审批通过，可直接发布或修改后重检",
+            "steps": [
+                "① 无需修改直接发布:               patchgate publish <BATCH_ID> --operator <姓名>",
+                "② 修改后重新校验 (沿用批次内规则快照):  patchgate check <BATCH_ID>",
+                "   然后审批+发布:                  patchgate approve <BATCH_ID> --approver <姓名>",
+                "                                   patchgate publish <BATCH_ID> --operator <姓名>",
+                "③ 一键续跑至发布:                  patchgate resume <BATCH_ID> --to publish --operator <姓名>",
+                "④ 确认当前规则快照与校验依据:       patchgate status <BATCH_ID>",
+                "                                   patchgate history <BATCH_ID> -t rules",
+            ],
+        }
+
     mapping = {
         BatchStatus.CREATED: {
             "desc": "已导入但尚未校验",
@@ -1384,18 +1603,7 @@ def _print_next_steps(st: BatchStatus, batch_id: Optional[str] = None, storage: 
                 "查看规则快照:        patchgate history <BATCH_ID> -t rules",
             ],
         },
-        BatchStatus.APPROVED: {
-            "desc": "审批通过，可直接发布或修改后重检（可能是首次审批通过，也可能是 revoke 撤销后回退到此）",
-            "steps": [
-                "① 无需修改直接发布:               patchgate publish <BATCH_ID> --operator <姓名>",
-                "② 修改后重新校验 (沿用批次内规则快照):  patchgate check <BATCH_ID>",
-                "   然后审批+发布:                  patchgate approve <BATCH_ID> --approver <姓名>",
-                "                                   patchgate publish <BATCH_ID> --operator <姓名>",
-                "③ 一键续跑至发布:                  patchgate resume <BATCH_ID> --to publish --operator <姓名>",
-                "④ 确认当前规则快照与校验依据:       patchgate status <BATCH_ID>",
-                "                                   patchgate history <BATCH_ID> -t rules",
-            ],
-        },
+        BatchStatus.APPROVED: approved_info,
         BatchStatus.PUBLISHED: {
             "desc": "已发布",
             "steps": [
@@ -1425,6 +1633,13 @@ def _print_next_steps(st: BatchStatus, batch_id: Optional[str] = None, storage: 
             if not consistency["is_consistent"] and consistency["diff"]:
                 print(f"  · [!] 与默认规则文件不一致: {consistency['diff']['summary']} (风险: {consistency['diff']['risk_level'].upper()})")
                 print(f"      沿用快照不变更，如需切换默认规则: patchgate check {batch_id} --rules {consistency['default_rules_path']} --force")
+        snapshot_decs = storage.get_snapshot_decisions(batch_id)
+        if snapshot_decs:
+            last_dec = snapshot_decs[-1]
+            if last_dec["decision"] == "keep_old":
+                print(f"  · 最近快照决策: 沿用旧快照 #{last_dec['old_snapshot_id']} ({last_dec.get('diff_summary', '-')})")
+            elif last_dec["decision"] == "override_to_new":
+                print(f"  · 最近快照决策: 覆盖 #{last_dec['old_snapshot_id']} → #{last_dec['new_snapshot_id']}")
     for s in info['steps']:
         bid = batch_id or "<BATCH_ID>"
         print(f"  · {s.replace('<BATCH_ID>', bid)}")

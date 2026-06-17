@@ -1021,8 +1021,8 @@ def test_revoke_docs_consistency(examples_dir):
     assert rc_status == 0, "status 失败"
     status_output = status_capture.getvalue()
     assert "下一步建议" in status_output, "status 应输出下一步建议"
-    assert "审批通过，可直接发布或修改后重检" in status_output, "status 下一步建议应描述 APPROVED 状态"
-    assert "直接发布" in status_output, "status 下一步建议应包含直接发布"
+    assert ("审批通过，可直接发布或修改后重检" in status_output or "撤销后回退到审批通过状态" in status_output), "status 下一步建议应描述 APPROVED 状态"
+    assert "直接发布" in status_output or "直接重新发布" in status_output, "status 下一步建议应包含直接发布"
     assert "修改后重新校验" in status_output, "status 下一步建议应包含修改后重跑校验"
     assert "一键续跑至发布" in status_output, "status 下一步建议应包含一键续跑"
     assert f"#{snap_id_before}" in status_output, "status 应显示规则快照 ID"
@@ -1323,7 +1323,7 @@ def test_cross_restart_self_evidence(examples_dir):
 
         # ① 能确认批次状态：APPROVED，可直接发布或修改后重检
         assert "APPROVED" in status_out.upper(), f"status 应显示 APPROVED 状态，实际输出：\n{status_out}"
-        assert "审批通过，可直接发布或修改后重检" in status_out, \
+        assert ("审批通过，可直接发布或修改后重检" in status_out or "撤销后回退到审批通过状态" in status_out), \
             f"status 应说明当前是 APPROVED 可直接发布或修改后重检，实际：\n{status_out}"
 
         # ② 能确认沿用的规则：快照 ID + SHA
@@ -1343,7 +1343,7 @@ def test_cross_restart_self_evidence(examples_dir):
             f"history -t rules 应显示与默认规则一致性，实际输出：\n{hist_out}"
 
         # 接手者视角：下一步建议中包含明确的 action
-        assert "直接发布" in status_out or "无需修改直接发布" in status_out, \
+        assert "直接发布" in status_out or "直接重新发布" in status_out or "无需修改直接发布" in status_out, \
             f"status 下一步应包含直接发布，实际：\n{status_out}"
         assert "重新校验" in status_out, \
             f"status 下一步应包含重新校验，实际：\n{status_out}"
@@ -1357,6 +1357,348 @@ def test_cross_restart_self_evidence(examples_dir):
             os.unlink(rules_backup)
 
     print("\n[OK][OK] 回归测试 12 通过: 跨重启/换人接手后可自证状态与规则依据 [OK][OK]")
+
+
+def test_snapshot_decision_recording(examples_dir, config_dir):
+    """回归测试 13: 快照决策记录 - keep_old 和 override_to_new 均写入 snapshot_decisions"""
+    separator("回归测试 13: 快照决策记录 (keep_old / override_to_new)")
+
+    db_path = os.path.join(TEST_DIR, "test_snapshot_decision.db")
+    clean_db(db_path)
+
+    bid = "test-snap-decision"
+    manifest_src = os.path.join(examples_dir, "manifest_good.json")
+    rules_default = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "config", "rules.yaml")
+    rules_alt = os.path.join(config_dir, "rules_test_checksum_error.yaml")
+
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "import", manifest_src, "--id", bid, "--name", "test"])
+    assert rc == 0, f"import 失败 rc={rc}\n{out}"
+
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid])
+    assert rc == 0, f"首次 check 失败 rc={rc}\n{out}"
+
+    storage = Storage(db_path)
+    snap1 = storage.get_active_rule_snapshot(bid)
+    assert snap1 is not None
+
+    decisions_before = storage.get_snapshot_decisions(bid)
+    assert len(decisions_before) == 0, "首次 check 不应产生快照决策记录"
+    print("[OK] 首次 check 无快照决策记录（规则未变更）")
+
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid, "--rules", rules_alt])
+    assert rc != 0, "不传 --force 换规则应被拒绝"
+    decisions_keep = storage.get_snapshot_decisions(bid)
+    assert len(decisions_keep) == 1, f"应记录 1 条 keep_old 决策，实际 {len(decisions_keep)}"
+    assert decisions_keep[0]["decision"] == "keep_old"
+    assert decisions_keep[0]["old_snapshot_id"] == snap1["id"]
+    assert decisions_keep[0]["new_snapshot_id"] is None
+    assert decisions_keep[0]["diff_summary"] is not None
+    print(f"[OK] 不带 --force 换规则时记录 keep_old 决策 (old=#{decisions_keep[0]['old_snapshot_id']})")
+
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid, "--rules", rules_alt, "--force"])
+    assert rc == 0, f"加 --force 换规则应成功 rc={rc}\n{out}"
+    decisions_after = storage.get_snapshot_decisions(bid)
+    assert len(decisions_after) == 2, f"应有 2 条决策记录，实际 {len(decisions_after)}"
+    assert decisions_after[1]["decision"] == "override_to_new"
+    assert decisions_after[1]["old_snapshot_id"] == snap1["id"]
+    assert decisions_after[1]["new_snapshot_id"] is not None
+    print(f"[OK] 带 --force 换规则时记录 override_to_new 决策 (#{decisions_after[1]['old_snapshot_id']} → #{decisions_after[1]['new_snapshot_id']})")
+
+    snap2 = storage.get_active_rule_snapshot(bid)
+    assert snap2["id"] != snap1["id"], "新快照 ID 应不同"
+    print(f"[OK] 快照决策记录完整: keep_old + override_to_new")
+
+    print("\n[OK][OK] 回归测试 13 通过: 快照决策记录正确 [OK][OK]")
+
+
+def test_snapshot_decision_cross_restart(examples_dir, config_dir):
+    """回归测试 14: 快照决策跨重启持久化 - 重新创建 Storage 后决策记录不丢失"""
+    separator("回归测试 14: 快照决策跨重启持久化")
+
+    db_path = os.path.join(TEST_DIR, "test_snap_decision_restart.db")
+    clean_db(db_path)
+
+    bid = "test-snap-restart"
+    manifest_src = os.path.join(examples_dir, "manifest_good.json")
+    rules_alt = os.path.join(config_dir, "rules_test_checksum_error.yaml")
+
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "import", manifest_src, "--id", bid, "--name", "test"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid])
+    assert rc == 0
+
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid, "--rules", rules_alt])
+    assert rc != 0
+
+    storage1 = Storage(db_path)
+    decisions1 = storage1.get_snapshot_decisions(bid)
+    assert len(decisions1) >= 1
+    dec1_id = decisions1[0]["id"]
+    dec1_note = decisions1[0]["note"]
+    print(f"[OK] 重启前决策记录: #{dec1_id}, decision={decisions1[0]['decision']}")
+
+    storage2 = Storage(db_path)
+    decisions2 = storage2.get_snapshot_decisions(bid)
+    assert len(decisions2) == len(decisions1), "重启后决策数量应一致"
+    assert decisions2[0]["id"] == dec1_id, "重启后决策 ID 应一致"
+    assert decisions2[0]["note"] == dec1_note, "重启后决策备注应一致"
+    assert decisions2[0]["decision"] == "keep_old"
+    print(f"[OK] 重启后决策记录一致: #{decisions2[0]['id']}, decision={decisions2[0]['decision']}")
+
+    rc, status_out = run_cli_capture(["--db", db_path, "--no-color", "status", bid])
+    assert "规则快照决策记录" in status_out, f"status 应显示决策记录，实际输出：\n{status_out}"
+    assert "沿用旧快照" in status_out, "status 应显示沿用旧快照决策"
+    print("[OK] 重启后 status 正确显示快照决策记录")
+
+    print("\n[OK][OK] 回归测试 14 通过: 快照决策跨重启持久化 [OK][OK]")
+
+
+def test_revoke_full_cycle_with_rules_change(examples_dir):
+    """回归测试 15: 撤销后完整链路 revoke→re-check→re-approve→re-publish（含规则变更）"""
+    separator("回归测试 15: revoke→re-check→re-approve→re-publish 完整链路（含规则变更）")
+
+    db_path = os.path.join(TEST_DIR, "test_revoke_full_cycle.db")
+    clean_db(db_path)
+
+    bid = "test-revoke-cycle"
+    manifest_src = os.path.join(examples_dir, "manifest_good.json")
+    rules_default = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "config", "rules.yaml")
+
+    rules_backup = rules_default + ".bak_test15"
+    shutil.copy2(rules_default, rules_backup)
+
+    try:
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "import", manifest_src, "--id", bid, "--name", "test"])
+        assert rc == 0
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid])
+        assert rc == 0
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "approve", bid, "--approver", "A", "--comment", "ok"])
+        assert rc == 0
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "publish", bid, "--operator", "A", "--comment", "release"])
+        assert rc == 0
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "revoke", bid, "--operator", "A", "--comment", "发现问题"])
+        assert rc == 0
+
+        storage = Storage(db_path)
+        snap_before = storage.get_active_rule_snapshot(bid)
+        assert snap_before is not None
+
+        with open(rules_default, "r", encoding="utf-8") as f:
+            orig = f.read()
+        modified = orig.replace(
+            "  - id: version_format\n    name: \"版本号格式检查\"\n    enabled: true",
+            "  - id: version_format\n    name: \"版本号格式检查(已禁用)\"\n    enabled: false"
+        )
+        with open(rules_default, "w", encoding="utf-8") as f:
+            f.write(modified)
+
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid])
+        assert rc == 0, f"revoke 后重新 check 应成功 rc={rc}\n{out}"
+        assert "与默认规则文件不一致" in out, "应提示默认规则变更"
+        assert "已记录" in out, "应记录快照决策"
+
+        decisions = storage.get_snapshot_decisions(bid)
+        assert len(decisions) >= 1, "应有快照决策记录"
+        assert decisions[-1]["decision"] == "keep_old", "应记录 keep_old 决策"
+        print("[OK] revoke 后重新 check：检测到规则变更，记录 keep_old 决策")
+
+        snap_after = storage.get_active_rule_snapshot(bid)
+        assert snap_after["id"] == snap_before["id"], "沿用旧快照 ID 不应变"
+        print(f"[OK] 沿用旧快照 #{snap_after['id']}，未创建新快照")
+
+        rc, status_out = run_cli_capture(["--db", db_path, "--no-color", "status", bid])
+        assert "撤销回退信息" in status_out, "status 应显示撤销回退信息"
+        assert "发现问题" in status_out, "status 应显示撤销原因"
+        assert "规则快照决策记录" in status_out, "status 应显示快照决策记录"
+        print("[OK] status 显示撤销回退信息和快照决策记录")
+
+        batch = storage.get_batch(bid)
+        assert batch["status"] == BatchStatus.CHECK_PASSED.value
+
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "approve", bid, "--approver", "B", "--comment", "修复后审批"])
+        assert rc == 0
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "publish", bid, "--operator", "B", "--comment", "重新发布"])
+        assert rc == 0
+
+        batch_final = storage.get_batch(bid)
+        assert batch_final["status"] == BatchStatus.PUBLISHED.value
+        print("[OK] 完整链路 revoke→re-check→re-approve→re-publish 成功")
+
+        pubs = storage.get_publish_records(bid)
+        actions = [p["action"] for p in pubs]
+        assert actions == ["publish", "revoke", "publish"], f"发布动作应为 publish→revoke→publish，实际 {actions}"
+        print(f"[OK] 发布历史: {'→'.join(actions)}")
+
+    finally:
+        if os.path.exists(rules_backup):
+            shutil.copy2(rules_backup, rules_default)
+            os.unlink(rules_backup)
+
+    print("\n[OK][OK] 回归测试 15 通过: revoke→re-check→re-approve→re-publish 完整链路 [OK][OK]")
+
+
+def test_export_snapshot_decisions_and_revoke_context(examples_dir):
+    """回归测试 16: 导出一致性 - JSON/Markdown 中 snapshot_decisions 和 revoke_context 完整"""
+    separator("回归测试 16: 导出一致性 (snapshot_decisions + revoke_context)")
+
+    db_path = os.path.join(TEST_DIR, "test_export_decisions.db")
+    clean_db(db_path)
+
+    bid = "test-export-dec"
+    manifest_src = os.path.join(examples_dir, "manifest_good.json")
+    rules_default = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "config", "rules.yaml")
+
+    rules_backup = rules_default + ".bak_test16"
+    shutil.copy2(rules_default, rules_backup)
+
+    try:
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "import", manifest_src, "--id", bid, "--name", "test"])
+        assert rc == 0
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid])
+        assert rc == 0
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "approve", bid, "--approver", "A", "--comment", "ok"])
+        assert rc == 0
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "publish", bid, "--operator", "A", "--comment", "release"])
+        assert rc == 0
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "revoke", bid, "--operator", "A", "--comment", "发现问题回滚"])
+        assert rc == 0
+
+        with open(rules_default, "r", encoding="utf-8") as f:
+            orig = f.read()
+        modified = orig.replace(
+            "  - id: version_format\n    name: \"版本号格式检查\"\n    enabled: true",
+            "  - id: version_format\n    name: \"版本号格式检查(已禁用)\"\n    enabled: false"
+        )
+        with open(rules_default, "w", encoding="utf-8") as f:
+            f.write(modified)
+
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid])
+        assert rc == 0
+
+        json_path = os.path.join(TEST_DIR, "export_decisions.json")
+        if os.path.exists(json_path):
+            os.unlink(json_path)
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "export", bid, "-o", json_path])
+        assert rc == 0 and os.path.exists(json_path)
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            j = json.load(f)
+
+        assert "snapshot_decisions" in j, "JSON 导出应包含 snapshot_decisions"
+        assert len(j["snapshot_decisions"]) >= 1, "应至少有 1 条快照决策"
+        sd = j["snapshot_decisions"][-1]
+        assert sd["decision"] == "keep_old", f"最新决策应为 keep_old，实际 {sd['decision']}"
+        assert sd["old_snapshot_id"] is not None, "应包含 old_snapshot_id"
+        assert sd.get("note"), "应包含决策备注"
+        print(f"[OK] JSON 导出: snapshot_decisions 包含 keep_old 决策 (备注: {sd['note'][:50]}...)")
+
+        assert "revoke_context" in j, "JSON 导出应包含 revoke_context"
+        rc_data = j["revoke_context"]
+        assert rc_data["revoke_operator"] == "A", f"撤销操作人应为 A，实际 {rc_data['revoke_operator']}"
+        assert "发现问题回滚" in (rc_data.get("revoke_comment") or ""), "应包含撤销原因"
+        print(f"[OK] JSON 导出: revoke_context 完整 (操作人={rc_data['revoke_operator']}, 原因={rc_data['revoke_comment']})")
+
+        os.unlink(json_path)
+
+        md_path = os.path.join(TEST_DIR, "export_decisions.md")
+        if os.path.exists(md_path):
+            os.unlink(md_path)
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "export", bid, "-o", md_path, "-f", "markdown"])
+        assert rc == 0 and os.path.exists(md_path)
+
+        with open(md_path, "r", encoding="utf-8") as f:
+            md = f.read()
+
+        assert "规则快照决策记录" in md, "Markdown 应包含规则快照决策记录章节"
+        assert "沿用旧快照" in md, "Markdown 应显示沿用旧快照决策"
+        assert "撤销回退信息" in md, "Markdown 应包含撤销回退信息章节"
+        assert "发现问题回滚" in md, "Markdown 应包含撤销原因"
+        print("[OK] Markdown 导出: 规则快照决策记录 + 撤销回退信息完整")
+
+        os.unlink(md_path)
+
+    finally:
+        if os.path.exists(rules_backup):
+            shutil.copy2(rules_backup, rules_default)
+            os.unlink(rules_backup)
+
+    print("\n[OK][OK] 回归测试 16 通过: JSON/Markdown 导出一致性 [OK][OK]")
+
+
+def test_status_history_export_revoke_consistency(examples_dir):
+    """回归测试 17: status/history/export 三处撤销信息一致性"""
+    separator("回归测试 17: status / history / export 三处撤销信息对齐")
+
+    db_path = os.path.join(TEST_DIR, "test_consistency.db")
+    clean_db(db_path)
+
+    bid = "test-consistency"
+    manifest_src = os.path.join(examples_dir, "manifest_good.json")
+
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "import", manifest_src, "--id", bid, "--name", "test"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "approve", bid, "--approver", "zhangsan", "--comment", "审批"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "publish", bid, "--operator", "lisi", "--comment", "发布"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "revoke", bid, "--operator", "wangwu", "--comment", "紧急回滚"])
+    assert rc == 0
+
+    storage = Storage(db_path)
+    snap = storage.get_active_rule_snapshot(bid)
+    assert snap is not None
+    snap_id = snap["id"]
+
+    rc, status_out = run_cli_capture(["--db", db_path, "--no-color", "status", bid])
+    assert rc == 0
+    assert "撤销回退信息" in status_out, "status 应显示撤销回退信息"
+    assert "wangwu" in status_out, "status 应显示撤销操作人"
+    assert "紧急回滚" in status_out, "status 应显示撤销原因"
+    assert f"#{snap_id}" in status_out, "status 应显示规则快照 ID"
+    assert "撤销后回退到审批通过状态" in status_out, "status 下一步应识别为撤销后回退"
+    print("[OK] status: 撤销回退信息 + 规则快照 + 撤销后回退建议 一致")
+
+    rc, hist_out = run_cli_capture(["--db", db_path, "--no-color", "history", bid, "-t", "rules"])
+    assert rc == 0
+    assert f"#{snap_id}" in hist_out, "history 应显示快照 ID"
+    print("[OK] history -t rules: 快照 ID 一致")
+
+    json_path = os.path.join(TEST_DIR, "consistency.json")
+    if os.path.exists(json_path):
+        os.unlink(json_path)
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "export", bid, "-o", json_path])
+    assert rc == 0
+    with open(json_path, "r", encoding="utf-8") as f:
+        j = json.load(f)
+
+    assert "revoke_context" in j
+    assert j["revoke_context"]["revoke_operator"] == "wangwu"
+    assert "紧急回滚" in j["revoke_context"]["revoke_comment"]
+    assert j["rule_snapshot"]["id"] == snap_id
+    assert "snapshot_decisions" in j
+    print("[OK] export: revoke_context + rule_snapshot + snapshot_decisions 与 status/history 一致")
+
+    md_path = os.path.join(TEST_DIR, "consistency.md")
+    if os.path.exists(md_path):
+        os.unlink(md_path)
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "export", bid, "-o", md_path, "-f", "markdown"])
+    assert rc == 0
+    with open(md_path, "r", encoding="utf-8") as f:
+        md = f.read()
+    assert "撤销回退信息" in md
+    assert "wangwu" in md
+    assert "紧急回滚" in md
+    print("[OK] Markdown export: 撤销回退信息与 status/history 一致")
+
+    os.unlink(json_path)
+    os.unlink(md_path)
+
+    print("\n[OK][OK] 回归测试 17 通过: status/history/export 三处一致 [OK][OK]")
 
 
 def main():
@@ -1382,6 +1724,11 @@ def main():
         ("回归-撤销后默认规则变更检测", lambda: test_revoke_default_rules_change_detection(examples_dir)),
         ("回归-导出规则一致性信息完整", lambda: test_export_rules_consistency_info(examples_dir)),
         ("回归-跨重启自证状态与规则", lambda: test_cross_restart_self_evidence(examples_dir)),
+        ("回归-快照决策记录", lambda: test_snapshot_decision_recording(examples_dir, config_dir)),
+        ("回归-快照决策跨重启持久化", lambda: test_snapshot_decision_cross_restart(examples_dir, config_dir)),
+        ("回归-撤销后完整链路含规则变更", lambda: test_revoke_full_cycle_with_rules_change(examples_dir)),
+        ("回归-导出快照决策与撤销上下文", lambda: test_export_snapshot_decisions_and_revoke_context(examples_dir)),
+        ("回归-status/history/export三处一致", lambda: test_status_history_export_revoke_consistency(examples_dir)),
     ]
     results = []
     for name, fn in tests:
