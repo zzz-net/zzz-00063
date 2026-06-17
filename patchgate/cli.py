@@ -14,7 +14,7 @@ from .models import (
     BatchStatus,
     CheckResultStatus,
 )
-from .rules import RuleEngine, create_engine_from_snapshot, diff_rules
+from .rules import RuleEngine, create_engine_from_snapshot, diff_rules, check_default_rules_vs_snapshot, get_default_rules_path
 from .storage import DEFAULT_DB_PATH, Storage
 
 
@@ -177,8 +177,7 @@ def cmd_import(args, storage: Storage) -> int:
     print(f"  条目数量  : {len(items)}")
     print(f"  当前状态  : {colorize(batch['status'], BatchStatus(batch['status']))}")
     print()
-    print("下一步建议:")
-    print(f"  patchgate check {batch_id}")
+    _print_next_steps(BatchStatus.CREATED, batch_id, storage)
     return 0
 
 
@@ -314,10 +313,22 @@ def cmd_check(args, storage: Storage) -> int:
     else:
         if active_snapshot:
             engine = create_engine_from_snapshot(active_snapshot)
+            consistency = check_default_rules_vs_snapshot(active_snapshot)
             print(f"[i] 沿用当前活动规则快照 #{active_snapshot['id']} ({active_snapshot['snapshot_name']})")
             print(f"    来源: {active_snapshot['rules_config_path']}")
             print(f"    SHA256: {active_snapshot['rules_sha256'][:16]}...")
             print(f"    创建时间: {active_snapshot['created_at']}")
+            if not consistency["is_consistent"] and consistency["diff"]:
+                diff = consistency["diff"]
+                print()
+                print(f"[!] 注意：当前默认规则文件 ({consistency['default_rules_path']}) 与本批次活动快照不一致。")
+                print(f"    本次校验将继续沿用快照 #{active_snapshot['id']} 的规则，不受外部文件变更影响。")
+                print(f"    差异概览: {diff['summary']} (风险: {diff['risk_level'].upper()})")
+                print()
+                print("    选项:")
+                print(f"      · 继续沿用旧快照（本次默认行为，无需额外参数）")
+                print(f"      · 切换到当前默认规则并创建新快照:  patchgate check {args.batch_id} --rules {consistency['default_rules_path']} --force")
+                print(f"      · 查看快照详情:  patchgate history {args.batch_id} -t rules")
         else:
             engine = RuleEngine()
             snapshot_name = "snapshot-1"
@@ -335,7 +346,11 @@ def cmd_check(args, storage: Storage) -> int:
             )
             print(f"[OK] 已创建初始规则快照 #{snap_id} ({snapshot_name})")
 
-    storage.transition_status(args.batch_id, BatchStatus.CHECKING, "system", "开始规则校验")
+    active_snapshot_id = storage.get_active_rule_snapshot(args.batch_id)
+    active_snapshot_id = active_snapshot_id["id"] if active_snapshot_id else None
+    snap_note = f" (规则快照 #{active_snapshot_id})" if active_snapshot_id else ""
+
+    storage.transition_status(args.batch_id, BatchStatus.CHECKING, "system", f"开始规则校验{snap_note}")
     print(f"[>] 开始校验批次 {args.batch_id} ...")
 
     enabled = engine.get_enabled_rules()
@@ -352,12 +367,12 @@ def cmd_check(args, storage: Storage) -> int:
     if has_error:
         storage.transition_status(
             args.batch_id, BatchStatus.CHECK_FAILED, "system",
-            f"校验完成: {result['errors']} 个错误, {result['warnings']} 个警告"
+            f"校验完成: {result['errors']} 个错误, {result['warnings']} 个警告{snap_note}"
         )
     else:
         storage.transition_status(
             args.batch_id, BatchStatus.CHECK_PASSED, "system",
-            f"校验通过: {result['passed']} 项通过, {result['warnings']} 个警告"
+            f"校验通过: {result['passed']} 项通过, {result['warnings']} 个警告{snap_note}"
         )
 
     _print_check_report(result, storage, args.batch_id, batch["items"])
@@ -366,12 +381,13 @@ def cmd_check(args, storage: Storage) -> int:
         print()
         print("[FAIL] 存在未解决的错误项，后续审批被阻塞。")
         print("  如需忽略请使用 --continue-on-error，或修复清单后重新执行 check。")
+        _print_next_steps(BatchStatus.CHECK_FAILED, args.batch_id, storage)
         return 2
 
     if not has_error:
         print()
         print(f"[PASS] 校验通过，状态已更新为: {colorize('CHECK_PASSED', BatchStatus.CHECK_PASSED)}")
-        print(f"  下一步: patchgate approve {args.batch_id} --approver <姓名>")
+        _print_next_steps(BatchStatus.CHECK_PASSED, args.batch_id, storage)
     return 0
 
 
@@ -467,8 +483,8 @@ def cmd_approve(args, storage: Storage) -> int:
     print(f"  审批人     : {args.approver}")
     print(f"  审批备注   : {args.comment or '(无)'}")
     print(f"  当前状态   : {colorize('APPROVED', BatchStatus.APPROVED)}")
-    print(f"  下一步: patchgate publish {args.batch_id} --operator <姓名>")
-    print(f"  或修改后重跑校验: patchgate check {args.batch_id}")
+    print()
+    _print_next_steps(BatchStatus.APPROVED, args.batch_id, storage)
     return 0
 
 
@@ -499,7 +515,8 @@ def cmd_reject(args, storage: Storage) -> int:
     print(f"  审批人     : {args.approver}")
     print(f"  驳回原因   : {args.comment}")
     print(f"  当前状态   : {colorize('REJECTED', BatchStatus.REJECTED)}")
-    print(f"  修复后请重新执行: patchgate check {args.batch_id}")
+    print()
+    _print_next_steps(BatchStatus.REJECTED, args.batch_id, storage)
     return 0
 
 
@@ -530,7 +547,9 @@ def cmd_publish(args, storage: Storage) -> int:
     print(f"  发布时间   : {datetime.now().isoformat(timespec='seconds')}")
     print(f"  发布备注   : {args.comment or '(无)'}")
     print(f"  当前状态   : {colorize('PUBLISHED', BatchStatus.PUBLISHED)}")
-    print(f"  导出发布摘要: patchgate export {args.batch_id} -o summary.json")
+    print()
+    _print_next_steps(BatchStatus.PUBLISHED, args.batch_id, storage)
+    print(f"  · 导出发布摘要: patchgate export {args.batch_id} -o summary.json")
     return 0
 
 
@@ -596,6 +615,8 @@ def cmd_revoke(args, storage: Storage) -> int:
         print(f"       patchgate status {args.batch_id}")
         print(f"       patchgate history {args.batch_id} -t rules")
         print(f"       patchgate history {args.batch_id} -t status")
+    print()
+    _print_next_steps(final_status, batch_id=args.batch_id, storage=storage)
     return 0
 
 
@@ -689,6 +710,7 @@ def cmd_export(args, storage: Storage) -> int:
     }
 
     if active_snapshot:
+        consistency = check_default_rules_vs_snapshot(active_snapshot)
         summary["rule_snapshot"] = {
             "id": active_snapshot["id"],
             "name": active_snapshot["snapshot_name"],
@@ -702,6 +724,14 @@ def cmd_export(args, storage: Storage) -> int:
             "created_at": active_snapshot["created_at"],
             "superseded_by": active_snapshot.get("superseded_by"),
             "rules_summary": active_snapshot["summary"],
+            "default_rules_consistency": {
+                "default_rules_path": consistency["default_rules_path"],
+                "default_exists": consistency["default_exists"],
+                "is_consistent": consistency["is_consistent"],
+                "default_rules_sha256": consistency.get("default_sha"),
+                "diff_summary": consistency["diff"]["summary"] if consistency.get("diff") else None,
+                "diff_risk_level": consistency["diff"]["risk_level"] if consistency.get("diff") else None,
+            },
         }
 
     summary["rule_snapshots"] = [
@@ -771,6 +801,19 @@ def _to_markdown(s: Dict[str, Any]) -> str:
         lines.append(f"- **操作人**: {rs.get('operator') or 'system'}")
         if rs.get("reason"):
             lines.append(f"- **备注**: {rs['reason']}")
+        if rs.get("default_rules_consistency"):
+            drc = rs["default_rules_consistency"]
+            if drc["is_consistent"]:
+                lines.append(f"- **与默认规则一致性**: 一致 (`{drc['default_rules_path']}`)")
+            else:
+                lines.append(f"- **与默认规则一致性**: [不一致]")
+                lines.append(f"  - 默认规则文件: `{drc['default_rules_path']}`")
+                if drc.get("diff_summary"):
+                    lines.append(f"  - 差异概览: {drc['diff_summary']}")
+                if drc.get("diff_risk_level"):
+                    lines.append(f"  - 风险等级: {drc['diff_risk_level'].upper()}")
+                lines.append(f"  - 说明: 本批次校验沿用快照 #{rs['id']} 的规则，不受外部默认规则文件变更影响。")
+                lines.append(f"    如需切换到当前默认规则，执行: `patchgate check <BATCH_ID> --rules {drc['default_rules_path']} --force`")
         lines.append("")
         lines.append("### 关键校验项")
         lines.append("")
@@ -955,10 +998,22 @@ def cmd_resume(args, storage: Storage) -> int:
     else:
         if active_snapshot:
             engine = create_engine_from_snapshot(active_snapshot)
+            consistency = check_default_rules_vs_snapshot(active_snapshot)
             print(f"[i] 沿用当前活动规则快照 #{active_snapshot['id']} ({active_snapshot['snapshot_name']})")
             print(f"    来源: {active_snapshot['rules_config_path']}")
             print(f"    SHA256: {active_snapshot['rules_sha256'][:16]}...")
             print(f"    创建时间: {active_snapshot['created_at']}")
+            if not consistency["is_consistent"] and consistency["diff"]:
+                diff = consistency["diff"]
+                print()
+                print(f"[!] 注意：当前默认规则文件 ({consistency['default_rules_path']}) 与本批次活动快照不一致。")
+                print(f"    本次续跑将继续沿用快照 #{active_snapshot['id']} 的规则，不受外部文件变更影响。")
+                print(f"    差异概览: {diff['summary']} (风险: {diff['risk_level'].upper()})")
+                print()
+                print("    选项:")
+                print(f"      · 继续沿用旧快照（本次默认行为，无需额外参数）")
+                print(f"      · 切换到当前默认规则并创建新快照:  patchgate resume {args.batch_id} --to {args.to} --rules {consistency['default_rules_path']} --force")
+                print(f"      · 查看快照详情:  patchgate history {args.batch_id} -t rules")
         else:
             engine = RuleEngine()
             snapshot_name = "snapshot-1"
@@ -983,7 +1038,12 @@ def cmd_resume(args, storage: Storage) -> int:
         "publish": [BatchStatus.PUBLISHED],
     }
     targets = target_to_stage[args.to]
-    if current in targets:
+    # --to check 时，即使用户已处于 check_passed/check_failed/approved，也认为用户想重新校验
+    force_rerun_check = (args.to == "check" and current in (
+        BatchStatus.CHECK_PASSED, BatchStatus.CHECK_FAILED,
+        BatchStatus.APPROVED, BatchStatus.REJECTED, BatchStatus.REVOKED,
+    ))
+    if current in targets and not force_rerun_check:
         print(f"[PASS] 已处于目标阶段，无需续跑")
         return 0
 
@@ -992,9 +1052,10 @@ def cmd_resume(args, storage: Storage) -> int:
     to_stage = args.to
 
     while stage != to_stage:
-        if stage == "created" or (stage in ("check_failed", "rejected", "revoked", "checking") and to_stage in ("check", "approve", "publish")) or (stage == "approved" and to_stage == "check"):
-            if stage == "approved" and to_stage != "publish":
-                print("→ 从审批通过状态重新执行规则校验 ...")
+        rerun_check = force_rerun_check or stage in ("created", "check_failed", "rejected", "revoked", "checking")
+        if rerun_check or (stage == "approved" and to_stage == "check"):
+            if stage in ("approved", "check_passed", "check_failed", "rejected", "revoked"):
+                print("→ 重新执行规则校验 ...")
             else:
                 print("→ 执行规则校验 ...")
             storage.transition_status(args.batch_id, BatchStatus.CHECKING, "resume", "续跑-重新校验")
@@ -1167,6 +1228,17 @@ def cmd_history(args, storage: Storage) -> int:
                 print(f"       SHA256: {s['rules_sha256'][:16]}...")
                 if s.get("reason"):
                     print(f"       备注: {s['reason']}")
+                if s["is_active"]:
+                    consistency = check_default_rules_vs_snapshot(s)
+                    if consistency["is_consistent"]:
+                        print(f"       与默认规则: 一致 ({consistency['default_rules_path']})")
+                    else:
+                        diff = consistency["diff"]
+                        print(f"       与默认规则: 不一致 (!)")
+                        print(f"         默认文件: {consistency['default_rules_path']}")
+                        if diff:
+                            print(f"         差异: {diff['summary']} (风险: {diff['risk_level'].upper()})")
+                            print(f"         如需切换: patchgate check {args.batch_id} --rules {consistency['default_rules_path']} --force")
                 print(f"       关键校验项:")
                 for rule in s["summary"]:
                     en = "启用" if rule["enabled"] else "禁用"
@@ -1205,6 +1277,7 @@ def cmd_status(args, storage: Storage) -> int:
 
     active_snapshot = storage.get_active_rule_snapshot(args.batch_id)
     if active_snapshot:
+        consistency = check_default_rules_vs_snapshot(active_snapshot)
         print(f"规则快照 (当前活动): #{active_snapshot['id']} {active_snapshot['snapshot_name']}")
         print(f"  来源文件   : {active_snapshot['rules_config_path']}")
         print(f"  SHA256     : {active_snapshot['rules_sha256'][:16]}...")
@@ -1217,6 +1290,15 @@ def cmd_status(args, storage: Storage) -> int:
         superseded = [s for s in all_snapshots if not s["is_active"]]
         if superseded:
             print(f"  历史快照   : {len(superseded)} 个已被覆盖")
+        if consistency["is_consistent"]:
+            print(f"  与默认规则 : 一致 ({consistency['default_rules_path']})")
+        else:
+            diff = consistency["diff"]
+            print(f"  与默认规则 : 不一致 (!)")
+            print(f"               默认文件: {consistency['default_rules_path']}")
+            if diff:
+                print(f"               差异: {diff['summary']} (风险: {diff['risk_level'].upper()})")
+                print(f"               如需切换到默认规则: patchgate check {args.batch_id} --rules {consistency['default_rules_path']} --force")
         print()
         print(f"  关键校验项:")
         for rule in active_snapshot["summary"]:
@@ -1260,11 +1342,11 @@ def cmd_status(args, storage: Storage) -> int:
             act = "发布" if p["action"] == "publish" else "撤销回退"
             print(f"  [{act}] {p['operator']} @ {p['created_at']}: {p.get('comment') or '(无)'}")
     print()
-    _print_next_steps(st)
+    _print_next_steps(st, args.batch_id, storage)
     return 0
 
 
-def _print_next_steps(st: BatchStatus):
+def _print_next_steps(st: BatchStatus, batch_id: Optional[str] = None, storage: Optional[Storage] = None):
     mapping = {
         BatchStatus.CREATED: {
             "desc": "已导入但尚未校验",
@@ -1303,12 +1385,15 @@ def _print_next_steps(st: BatchStatus):
             ],
         },
         BatchStatus.APPROVED: {
-            "desc": "审批通过，可直接发布或修改后重检",
+            "desc": "审批通过，可直接发布或修改后重检（可能是首次审批通过，也可能是 revoke 撤销后回退到此）",
             "steps": [
-                "直接发布:           patchgate publish <BATCH_ID> --operator <姓名>",
-                "修改后重新校验:     patchgate check <BATCH_ID>",
-                "一键续跑至发布:   patchgate resume <BATCH_ID> --to publish --operator <姓名>",
-                "查看规则快照:       patchgate status <BATCH_ID>",
+                "① 无需修改直接发布:               patchgate publish <BATCH_ID> --operator <姓名>",
+                "② 修改后重新校验 (沿用批次内规则快照):  patchgate check <BATCH_ID>",
+                "   然后审批+发布:                  patchgate approve <BATCH_ID> --approver <姓名>",
+                "                                   patchgate publish <BATCH_ID> --operator <姓名>",
+                "③ 一键续跑至发布:                  patchgate resume <BATCH_ID> --to publish --operator <姓名>",
+                "④ 确认当前规则快照与校验依据:       patchgate status <BATCH_ID>",
+                "                                   patchgate history <BATCH_ID> -t rules",
             ],
         },
         BatchStatus.PUBLISHED: {
@@ -1327,10 +1412,22 @@ def _print_next_steps(st: BatchStatus):
         },
     }
     info = mapping.get(st)
-    if info:
-        print(f"下一步建议 ({info['desc']}):")
-        for s in info['steps']:
-            print(f"  · {s}")
+    if not info:
+        return
+    print(f"下一步建议 ({info['desc']}):")
+    snap_info = ""
+    if batch_id and storage:
+        snap = storage.get_active_rule_snapshot(batch_id)
+        if snap:
+            snap_info = f"  · 当前校验规则依据: 快照 #{snap['id']} ({snap['snapshot_name']}), SHA256: {snap['rules_sha256'][:16]}..."
+            print(snap_info)
+            consistency = check_default_rules_vs_snapshot(snap)
+            if not consistency["is_consistent"] and consistency["diff"]:
+                print(f"  · [!] 与默认规则文件不一致: {consistency['diff']['summary']} (风险: {consistency['diff']['risk_level'].upper()})")
+                print(f"      沿用快照不变更，如需切换默认规则: patchgate check {batch_id} --rules {consistency['default_rules_path']} --force")
+    for s in info['steps']:
+        bid = batch_id or "<BATCH_ID>"
+        print(f"  · {s.replace('<BATCH_ID>', bid)}")
 
 
 def cmd_list(args, storage: Storage) -> int:

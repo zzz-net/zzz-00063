@@ -14,14 +14,18 @@ from .storage import Storage
 RuleFn = Callable[[Any, Dict[str, Any], Storage, str], List[Dict[str, Any]]]
 
 
+def get_default_rules_path() -> str:
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "config",
+        "rules.yaml",
+    )
+
+
 class RuleEngine:
     def __init__(self, rules_config_path: Optional[str] = None):
         if rules_config_path is None:
-            rules_config_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                "config",
-                "rules.yaml",
-            )
+            rules_config_path = get_default_rules_path()
         self.rules_config_path = rules_config_path
         self.rules = self._load_rules()
         self._handlers = self._build_handlers()
@@ -482,3 +486,43 @@ def diff_rules(engine_a: RuleEngine, engine_b: RuleEngine) -> Dict[str, Any]:
             f"修改 {len(changed)} 条规则"
         ),
     }
+
+
+def check_default_rules_vs_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    比较当前默认规则文件与活动快照的差异。
+
+    返回:
+        {
+            "default_rules_path": str,        # 默认规则文件路径
+            "default_exists": bool,            # 默认文件是否存在
+            "snapshot_sha": str,               # 快照 SHA
+            "default_sha": str | None,         # 默认文件 SHA（不存在时为 None）
+            "is_consistent": bool,             # 是否一致
+            "diff": dict | None,               # 差异详情（diff_rules 返回格式，一致时为 None）
+        }
+    """
+    default_path = get_default_rules_path()
+    snap_sha = snapshot["rules_sha256"]
+    result = {
+        "default_rules_path": default_path,
+        "snapshot_sha": snap_sha,
+        "default_exists": False,
+        "default_sha": None,
+        "is_consistent": True,
+        "diff": None,
+    }
+    if not os.path.exists(default_path):
+        result["is_consistent"] = True
+        return result
+    result["default_exists"] = True
+    default_engine = RuleEngine(default_path)
+    default_sha = default_engine.get_rules_sha256()
+    result["default_sha"] = default_sha
+    if default_sha == snap_sha:
+        result["is_consistent"] = True
+        return result
+    snapshot_engine = create_engine_from_snapshot(snapshot)
+    result["is_consistent"] = False
+    result["diff"] = diff_rules(snapshot_engine, default_engine)
+    return result

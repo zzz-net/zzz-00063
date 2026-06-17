@@ -18,6 +18,7 @@ from patchgate.storage import Storage
 
 
 TEST_DB = os.path.join(os.path.dirname(__file__), ".test_patchgate", "test.db")
+TEST_DIR = os.path.dirname(TEST_DB)
 
 
 def run_cli(*args):
@@ -41,6 +42,31 @@ def cleanup():
     examples_dir = Path(_PROJECT_ROOT) / "examples"
     config_dir = Path(_PROJECT_ROOT) / "config"
     return examples_dir, config_dir
+
+
+def run_cli_capture(args_list):
+    """运行 CLI 命令并捕获 (退出码, 输出字符串)，args_list 是不含 --db/--no-color 的参数列表"""
+    import io
+    buf = io.StringIO()
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    try:
+        sys.stdout = buf
+        sys.stderr = buf
+        rc = cli_main(args_list)
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+    return rc, buf.getvalue()
+
+
+def clean_db(db_path):
+    """删除指定 db 文件，确保测试从零开始"""
+    d = os.path.dirname(db_path)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
+    if os.path.exists(db_path):
+        os.unlink(db_path)
 
 
 def test_normal_pipeline(examples_dir):
@@ -1064,6 +1090,275 @@ def test_revoke_docs_consistency(examples_dir):
     print("\n[OK][OK] 回归测试 9 通过: revoke 说明链路（CLI/状态表/status/export）完全一致 [OK][OK]")
 
 
+def test_revoke_default_rules_change_detection(examples_dir):
+    """
+    回归测试 10: 撤销后默认规则文件变更的检测与提示
+    场景：批次 check→approve→publish→revoke 后，用户修改了默认 config/rules.yaml，
+         再次 check（不传 --rules）时，应检测到默认规则与快照不一致，
+         明确告知用户沿用旧快照，如需切换需显式 --force。
+    """
+    db_path = os.path.join(TEST_DIR, "test_revoke_default_rules_change.db")
+    clean_db(db_path)
+
+    bid = "test-revoke-default-change"
+    manifest_src = os.path.join(examples_dir, "manifest_good.json")
+    rules_default = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "config", "rules.yaml")
+    assert os.path.exists(rules_default), f"默认规则文件应存在: {rules_default}"
+
+    # 备份默认规则
+    rules_backup = rules_default + ".bak_test10"
+    shutil.copy2(rules_default, rules_backup)
+
+    try:
+        # 步骤 1-4: import → check（不传 --rules，使用默认）→ approve → publish → revoke
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "import", manifest_src, "--id", bid, "--name", "test"])
+        assert rc == 0, f"import 应成功 rc={rc}\n{out}"
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid])
+        assert rc == 0, f"首次 check 应成功 (rc=0)，实际 rc={rc}\n{out}"
+
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "approve", bid,
+                                   "--approver", "tester", "--comment", "ok"])
+        assert rc == 0
+
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "publish", bid,
+                                   "--operator", "op", "--comment", "release"])
+        assert rc == 0
+
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "revoke", bid,
+                                   "--operator", "op", "--comment", "rollback"])
+        assert rc == 0
+
+        # 记录当前快照 ID 和 SHA
+        rc, status_out = run_cli_capture(["--db", db_path, "--no-color", "status", bid])
+        assert "快照 #" in status_out, f"撤销后 status 应显示规则快照，实际输出：\n{status_out}"
+
+        # 步骤 5: 修改默认规则文件（禁用一条规则 + 改一条 severity）
+        with open(rules_default, "r", encoding="utf-8") as f:
+            orig_rules_content = f.read()
+        modified_rules_content = orig_rules_content.replace(
+            "  - id: version_format\n    name: \"版本号格式检查\"\n    enabled: true",
+            "  - id: version_format\n    name: \"版本号格式检查(已禁用)\"\n    enabled: false"
+        ).replace(
+            "severity: warning\n    description: \"发布包必须包含 checksum 校验和\"",
+            "severity: error\n    description: \"发布包必须包含 checksum 校验和(已升级)\""
+        )
+        assert modified_rules_content != orig_rules_content, "修改后的规则内容应与原内容不同"
+        with open(rules_default, "w", encoding="utf-8") as f:
+            f.write(modified_rules_content)
+
+        # 步骤 6: 不传 --rules 重新 check，应检测到不一致并提示沿用旧快照
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid])
+        assert rc == 0, f"不传 --rules check 应沿用旧快照并成功 (rc=0)，实际 rc={rc}\n{out}"
+        assert "与默认规则文件不一致" in out, \
+            f"check 输出应提示默认规则与快照不一致，实际输出：\n{out}"
+        assert "沿用快照不变更" in out, \
+            f"check 输出应告知默认沿用旧快照，实际输出：\n{out}"
+        assert "--force" in out, \
+            f"check 输出应提示如需切换用 --force，实际输出：\n{out}"
+
+        # 步骤 7: status 也应显示不一致提示
+        rc, status_out = run_cli_capture(["--db", db_path, "--no-color", "status", bid])
+        assert "规则快照" in status_out
+        assert "与默认规则" in status_out, \
+            f"status 应显示默认规则一致性状态，实际输出：\n{status_out}"
+
+        # 步骤 8: history rules 也应显示一致性信息
+        rc, hist_out = run_cli_capture(["--db", db_path, "--no-color", "history", bid, "-t", "rules"])
+        assert "与默认规则" in hist_out, \
+            f"history -t rules 应显示默认规则一致性，实际输出：\n{hist_out}"
+
+        # 步骤 9: 加 --force --rules <默认规则路径> 应成功切换并覆盖
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid,
+                                   "--rules", rules_default, "--force"])
+        assert rc == 0, f"加 --force --rules 切换默认规则应成功 (rc=0)，实际 rc={rc}\n{out}"
+        assert "已更新活动规则快照" in out or "规则快照" in out, \
+            f"加 --force 后应更新快照，实际输出：\n{out}"
+
+        # 步骤 10: 切换后再次 check，应不再提示与默认规则不一致
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid])
+        assert rc == 0
+        # 快照已更新为默认规则，不应再提示不一致
+        assert "与默认规则文件不一致" not in out, \
+            f"切换后快照与默认规则一致，不应再提示不一致，实际输出：\n{out}"
+
+    finally:
+        # 恢复默认规则
+        if os.path.exists(rules_backup):
+            shutil.copy2(rules_backup, rules_default)
+            os.unlink(rules_backup)
+
+    print("\n[OK][OK] 回归测试 10 通过: 撤销后默认规则变更检测与显式覆盖流程正确 [OK][OK]")
+
+
+def test_export_rules_consistency_info(examples_dir):
+    """
+    回归测试 11: 导出结果（JSON/Markdown）中规则一致性信息完整
+    场景：创建批次，校验后修改默认规则文件，导出时 JSON/Markdown 中应
+         包含 default_rules_consistency 信息（一致/不一致、diff 概览、风险等级、切换命令）
+    """
+    db_path = os.path.join(TEST_DIR, "test_export_rules_consistency.db")
+    clean_db(db_path)
+
+    bid = "test-export-consistency"
+    manifest_src = os.path.join(examples_dir, "manifest_good.json")
+    rules_default = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "config", "rules.yaml")
+
+    rules_backup = rules_default + ".bak_test11"
+    shutil.copy2(rules_default, rules_backup)
+
+    try:
+        # import + check（使用默认规则）
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "import", manifest_src, "--id", bid, "--name", "test"])
+        assert rc == 0, f"import 失败 rc={rc}\n{out}"
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid])
+        assert rc == 0, f"check 失败 rc={rc}\n{out}"
+
+        # 修改默认规则
+        with open(rules_default, "r", encoding="utf-8") as f:
+            orig = f.read()
+        modified = orig.replace(
+            "  - id: version_format\n    name: \"版本号格式检查\"\n    enabled: true",
+            "  - id: version_format\n    name: \"版本号格式检查(已禁用)\"\n    enabled: false"
+        )
+        with open(rules_default, "w", encoding="utf-8") as f:
+            f.write(modified)
+
+        # 导出 JSON
+        json_path = os.path.join(TEST_DIR, "export_consistency.json")
+        if os.path.exists(json_path):
+            os.unlink(json_path)
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "export", bid, "-o", json_path])
+        assert rc == 0 and os.path.exists(json_path), f"JSON 导出应成功，rc={rc}\n{out}"
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            j = json.load(f)
+
+        assert "rule_snapshot" in j, "JSON 导出应包含 rule_snapshot"
+        rs = j["rule_snapshot"]
+        assert "default_rules_consistency" in rs, \
+            "JSON 导出的 rule_snapshot 应包含 default_rules_consistency 字段"
+        drc = rs["default_rules_consistency"]
+        assert drc.get("default_rules_path"), "应包含默认规则路径"
+        assert drc.get("is_consistent") is False, \
+            f"修改默认规则后 is_consistent 应为 False，实际: {drc.get('is_consistent')}"
+        assert drc.get("diff_summary"), "不一致时应包含 diff_summary"
+        assert drc.get("diff_risk_level"), "不一致时应包含 diff_risk_level"
+        print("[OK] JSON 导出：default_rules_consistency 字段完整（is_consistent=False，diff 概览+风险等级齐全）")
+        os.unlink(json_path)
+
+        # 导出 Markdown
+        md_path = os.path.join(TEST_DIR, "export_consistency.md")
+        if os.path.exists(md_path):
+            os.unlink(md_path)
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "export", bid, "-o", md_path, "-f", "markdown"])
+        assert rc == 0 and os.path.exists(md_path), f"Markdown 导出应成功，rc={rc}\n{out}"
+
+        with open(md_path, "r", encoding="utf-8") as f:
+            md = f.read()
+        assert "与默认规则一致性" in md, "Markdown 应包含'与默认规则一致性'章节"
+        assert "[不一致]" in md, "不一致时 Markdown 应标记 [不一致]"
+        assert "差异概览" in md, "Markdown 应包含差异概览"
+        assert "风险等级" in md, "Markdown 应包含风险等级"
+        assert "如需切换到当前默认规则" in md, "Markdown 应包含切换命令提示"
+        print("[OK] Markdown 导出：与默认规则一致性章节完整（不一致标记、差异概览、风险等级、切换命令）")
+        os.unlink(md_path)
+
+    finally:
+        if os.path.exists(rules_backup):
+            shutil.copy2(rules_backup, rules_default)
+            os.unlink(rules_backup)
+
+    print("\n[OK][OK] 回归测试 11 通过: JSON/Markdown 导出规则一致性信息完整 [OK][OK]")
+
+
+def test_cross_restart_self_evidence(examples_dir):
+    """
+    回归测试 12: 跨重启后状态与规则快照自证
+    场景：模拟换人接手或进程重启（创建全新 Storage 实例），
+         通过 status / history / export 可快速确认：
+         ① 批次当前该先重检还是能直接重发
+         ② 本次校验沿用的是哪份规则
+         ③ 规则快照与当前默认规则是否一致
+    """
+    db_path = os.path.join(TEST_DIR, "test_cross_restart_self_evidence.db")
+    clean_db(db_path)
+
+    bid = "test-restart-self"
+    manifest_src = os.path.join(examples_dir, "manifest_good.json")
+    rules_default = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "config", "rules.yaml")
+
+    rules_backup = rules_default + ".bak_test12"
+    shutil.copy2(rules_default, rules_backup)
+
+    try:
+        # "进程1"：导入 → check → approve → publish → revoke → 回到 APPROVED
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "import", manifest_src, "--id", bid, "--name", "test"])
+        assert rc == 0, f"import 失败 rc={rc}\n{out}"
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid])
+        assert rc == 0, f"check 失败 rc={rc}\n{out}"
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "approve", bid, "--approver", "A", "--comment", "ok"])
+        assert rc == 0, f"approve 失败 rc={rc}\n{out}"
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "publish", bid, "--operator", "A", "--comment", "release"])
+        assert rc == 0, f"publish 失败 rc={rc}\n{out}"
+        rc, out = run_cli_capture(["--db", db_path, "--no-color", "revoke", bid, "--operator", "A", "--comment", "rollback"])
+        assert rc == 0, f"revoke 失败 rc={rc}\n{out}"
+
+        # 模拟进程重启/换人接手：直接在同一个 db 上操作，关键是"接手者"没见过之前的输出
+        # 修改默认规则，让接手者通过查询就能发现不一致
+        with open(rules_default, "r", encoding="utf-8") as f:
+            orig = f.read()
+        modified = orig.replace(
+            "  - id: version_format\n    name: \"版本号格式检查\"\n    enabled: true",
+            "  - id: version_format\n    name: \"版本号格式检查(已禁用)\"\n    enabled: false"
+        )
+        with open(rules_default, "w", encoding="utf-8") as f:
+            f.write(modified)
+
+        # 接手者视角：先 status，确认当前状态 + 下一步 + 规则依据
+        rc, status_out = run_cli_capture(["--db", db_path, "--no-color", "status", bid])
+        assert rc == 0, f"新进程打开已有 db 后 status 应成功，rc={rc}\n{status_out}"
+
+        # ① 能确认批次状态：APPROVED，可直接发布或修改后重检
+        assert "APPROVED" in status_out.upper(), f"status 应显示 APPROVED 状态，实际输出：\n{status_out}"
+        assert "审批通过，可直接发布或修改后重检" in status_out, \
+            f"status 应说明当前是 APPROVED 可直接发布或修改后重检，实际：\n{status_out}"
+
+        # ② 能确认沿用的规则：快照 ID + SHA
+        assert "规则快照 #" in status_out or "快照 #" in status_out, f"status 应显示规则快照 ID，实际：\n{status_out}"
+        assert "SHA256:" in status_out, f"status 应显示快照 SHA256，实际：\n{status_out}"
+
+        # ③ 能确认与默认规则是否一致
+        assert "与默认规则" in status_out, \
+            f"status 应显示默认规则一致性状态，实际：\n{status_out}"
+
+        # 接手者视角：history -t rules，进一步查看规则快照详情
+        rc, hist_out = run_cli_capture(["--db", db_path, "--no-color", "history", bid, "-t", "rules"])
+        assert rc == 0
+        assert "snapshot-" in hist_out or "快照" in hist_out, \
+            f"history -t rules 应列出规则快照，实际输出：\n{hist_out}"
+        assert "与默认规则" in hist_out, \
+            f"history -t rules 应显示与默认规则一致性，实际输出：\n{hist_out}"
+
+        # 接手者视角：下一步建议中包含明确的 action
+        assert "直接发布" in status_out or "无需修改直接发布" in status_out, \
+            f"status 下一步应包含直接发布，实际：\n{status_out}"
+        assert "重新校验" in status_out, \
+            f"status 下一步应包含重新校验，实际：\n{status_out}"
+
+        print("[OK] 跨重启自证: status 可一眼确认①状态/下一步 ②规则快照ID/SHA ③与默认规则一致性")
+        print("[OK] 跨重启自证: history -t rules 可追溯规则快照详情与一致性")
+
+    finally:
+        if os.path.exists(rules_backup):
+            shutil.copy2(rules_backup, rules_default)
+            os.unlink(rules_backup)
+
+    print("\n[OK][OK] 回归测试 12 通过: 跨重启/换人接手后可自证状态与规则依据 [OK][OK]")
+
+
 def main():
     examples_dir, config_dir = cleanup()
     all_passed = True
@@ -1084,6 +1379,9 @@ def main():
         ("回归-旧批次重新导出一致", lambda: test_rule_snapshot_re_export(examples_dir)),
         ("回归-resume的规则快照", lambda: test_rule_snapshot_resume(examples_dir, config_dir)),
         ("回归-revoke说明链路一致", lambda: test_revoke_docs_consistency(examples_dir)),
+        ("回归-撤销后默认规则变更检测", lambda: test_revoke_default_rules_change_detection(examples_dir)),
+        ("回归-导出规则一致性信息完整", lambda: test_export_rules_consistency_info(examples_dir)),
+        ("回归-跨重启自证状态与规则", lambda: test_cross_restart_self_evidence(examples_dir)),
     ]
     results = []
     for name, fn in tests:
