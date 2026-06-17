@@ -30,7 +30,7 @@ BATCH_STATUS_FLOW = {
     BatchStatus.CHECK_FAILED: [BatchStatus.CHECKING, BatchStatus.REJECTED],
     BatchStatus.CHECK_PASSED: [BatchStatus.APPROVED, BatchStatus.REJECTED],
     BatchStatus.REJECTED: [BatchStatus.CHECKING],
-    BatchStatus.APPROVED: [BatchStatus.PUBLISHED],
+    BatchStatus.APPROVED: [BatchStatus.PUBLISHED, BatchStatus.CHECKING],
     BatchStatus.PUBLISHED: [BatchStatus.REVOKED],
     BatchStatus.REVOKED: [BatchStatus.CHECKING, BatchStatus.APPROVED],
 }

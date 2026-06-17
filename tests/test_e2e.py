@@ -13,6 +13,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _PROJECT_ROOT)
 
 from patchgate.cli import main as cli_main
+from patchgate.models import BatchStatus
 from patchgate.storage import Storage
 
 
@@ -626,8 +627,8 @@ def test_rule_snapshot_change(examples_dir, config_dir):
 
 
 def test_rule_snapshot_revoke_republish(examples_dir):
-    """回归测试 6: revoke 后重发 - 规则快照在 revoke→重新发布链路中保持一致"""
-    separator("回归测试 6: revoke 后重发的规则快照一致性")
+    """回归测试 6: revoke 后重发 - 完整链路 publish→revoke→check→approve→publish，验证规则快照和状态历史"""
+    separator("回归测试 6: revoke 后重发(完整链路)的规则快照一致性与状态历史")
 
     mid = f"{examples_dir}/manifest_good.json"
     rc = run_cli("import", mid, "--id", "test-snapshot-revoke", "--name", "测试-revoke重发快照")
@@ -642,12 +643,16 @@ def test_rule_snapshot_revoke_republish(examples_dir):
     sha_before = snap_before["rules_sha256"]
     snap_id_before = snap_before["id"]
     rules_yaml_before = snap_before["rules_yaml"]
+    rule_count_before = snap_before["rule_count"]
+    enabled_count_before = snap_before["enabled_rule_count"]
     print(f"[OK] 发布前快照: #{snap_id_before}, SHA256: {sha_before[:16]}...")
 
     rc = run_cli("approve", "test-snapshot-revoke", "--approver", "tester", "--comment", "审批通过")
     assert rc == 0, "approve 失败"
     rc = run_cli("publish", "test-snapshot-revoke", "--operator", "op", "--comment", "发布")
     assert rc == 0, "publish 失败"
+    batch = storage.get_batch("test-snapshot-revoke")
+    assert batch["status"] == BatchStatus.PUBLISHED.value
     print("[OK] 已发布")
 
     snap_after_publish = storage.get_active_rule_snapshot("test-snapshot-revoke")
@@ -658,7 +663,9 @@ def test_rule_snapshot_revoke_republish(examples_dir):
 
     rc = run_cli("revoke", "test-snapshot-revoke", "--operator", "op", "--comment", "发现问题回滚")
     assert rc == 0, "revoke 失败"
-    print("[OK] 已撤销发布")
+    batch_after_revoke = storage.get_batch("test-snapshot-revoke")
+    assert batch_after_revoke["status"] == BatchStatus.APPROVED.value, "revoke 后状态应为 APPROVED"
+    print("[OK] 已撤销发布，状态已回退至 APPROVED")
 
     snap_after_revoke = storage.get_active_rule_snapshot("test-snapshot-revoke")
     assert snap_after_revoke is not None
@@ -670,9 +677,58 @@ def test_rule_snapshot_revoke_republish(examples_dir):
     assert len(all_snaps_revoke) == 1, "revoke 后不应新增快照"
     print("[OK] revoke 后规则快照保持不变，未创建新快照")
 
+    status_history_before_recheck = storage.get_status_history("test-snapshot-revoke")
+    print(f"[OK] revoke 后状态历史共 {len(status_history_before_recheck)} 条")
+
+    rc = run_cli("check", "test-snapshot-revoke")
+    assert rc == 0, "revoke 后重新 check 应成功（APPROVED -> CHECKING 流转）"
+    batch_after_recheck = storage.get_batch("test-snapshot-revoke")
+    assert batch_after_recheck["status"] == BatchStatus.CHECK_PASSED.value, "重新 check 后状态应为 CHECK_PASSED"
+    print("[OK] revoke 后重新 check 成功（APPROVED → CHECKING → CHECK_PASSED）")
+
+    snap_after_recheck = storage.get_active_rule_snapshot("test-snapshot-revoke")
+    assert snap_after_recheck["id"] == snap_id_before, "重新 check 后仍应沿用原快照"
+    assert snap_after_recheck["rules_sha256"] == sha_before, "重新 check 后 SHA256 应一致"
+    assert snap_after_recheck["rule_count"] == rule_count_before, "重新 check 后规则总数应一致"
+    assert snap_after_recheck["enabled_rule_count"] == enabled_count_before, "重新 check 后启用规则数应一致"
+    all_snaps_after_recheck = storage.get_rule_snapshots("test-snapshot-revoke")
+    assert len(all_snaps_after_recheck) == 1, "重新 check 不应创建新快照"
+    print("[OK] revoke 后重新 check 沿用原规则快照，未创建新快照")
+
+    status_history = storage.get_status_history("test-snapshot-revoke")
+    print(f"[OK] 当前状态历史共 {len(status_history)} 条")
+
+    status_values = [h["to_status"] for h in status_history]
+    assert status_values[-3:] == [
+        BatchStatus.REVOKED.value,
+        BatchStatus.APPROVED.value,
+        BatchStatus.CHECKING.value,
+    ] or status_values[-2:] == [
+        BatchStatus.CHECKING.value,
+        BatchStatus.CHECK_PASSED.value,
+    ], f"状态历史应包含 REVOKED→APPROVED→CHECKING→CHECK_PASSED，实际: {status_values[-5:]}"
+
+    found_approved_to_checking = False
+    for i in range(len(status_history) - 1):
+        if (status_history[i]["to_status"] == BatchStatus.APPROVED.value
+                and status_history[i + 1]["from_status"] == BatchStatus.APPROVED.value
+                and status_history[i + 1]["to_status"] == BatchStatus.CHECKING.value):
+            found_approved_to_checking = True
+            break
+    if not found_approved_to_checking:
+        for h in status_history:
+            if (h.get("from_status") == BatchStatus.APPROVED.value
+                    and h["to_status"] == BatchStatus.CHECKING.value):
+                found_approved_to_checking = True
+                break
+    assert found_approved_to_checking, "状态历史中应存在 APPROVED → CHECKING 的流转记录"
+    print("[OK] 状态历史包含完整流转链：APPROVED → CHECKING → CHECK_PASSED")
+
+    rc = run_cli("approve", "test-snapshot-revoke", "--approver", "tester2", "--comment", "修复后重新审批")
+    assert rc == 0, "重新 approve 失败"
     rc = run_cli("publish", "test-snapshot-revoke", "--operator", "op2", "--comment", "重新发布")
     assert rc == 0, "重新 publish 失败"
-    print("[OK] 已重新发布")
+    print("[OK] 已重新审批并发布")
 
     snap_final = storage.get_active_rule_snapshot("test-snapshot-revoke")
     assert snap_final["id"] == snap_id_before, "重新发布后快照 ID 仍应一致"
@@ -680,11 +736,18 @@ def test_rule_snapshot_revoke_republish(examples_dir):
     assert snap_final["rules_yaml"] == rules_yaml_before, "重新发布后规则内容仍应一致"
     all_snaps_final = storage.get_rule_snapshots("test-snapshot-revoke")
     assert len(all_snaps_final) == 1, "整个链路中只有 1 个快照"
-    print("[OK] revoke→重新发布 整个链路中规则快照保持一致")
+    print("[OK] 完整链路 publish→revoke→check→approve→publish 中规则快照保持一致")
 
     pub_records = storage.get_publish_records("test-snapshot-revoke")
-    assert len(pub_records) >= 2, "发布历史应至少 2 条（发布+撤销+重发）"
-    print(f"[OK] 发布历史共 {len(pub_records)} 条，规则快照始终为同一个")
+    assert len(pub_records) >= 3, f"发布历史应至少 3 条（发布+撤销+重发），实际 {len(pub_records)}"
+    actions = [p["action"] for p in pub_records]
+    assert actions[-3:] == ["publish", "revoke", "publish"], f"发布动作顺序应为 publish→revoke→publish，实际 {actions}"
+    print(f"[OK] 发布历史共 {len(pub_records)} 条，动作顺序：{'→'.join(actions)}")
+
+    status_history_final = storage.get_status_history("test-snapshot-revoke")
+    print(f"[OK] 完整状态历史共 {len(status_history_final)} 条")
+    status_seq = [h["to_status"] for h in status_history_final]
+    print(f"     状态流转链: {' → '.join(status_seq)}")
 
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w", encoding="utf-8") as tf:
         json_path = tf.name
@@ -696,9 +759,10 @@ def test_rule_snapshot_revoke_republish(examples_dir):
         assert data["rule_snapshot"]["id"] == snap_id_before, "导出的活动快照 ID 应匹配"
         assert data["rule_snapshot"]["is_active"] is True, "导出的活动快照应标记为活动"
         assert len(data["rule_snapshots"]) == 1, "导出的快照历史应为 1 条"
-        assert len(data["publish_history"]) >= 2, "发布历史应至少 2 条"
+        assert len(data["publish_history"]) >= 3, f"导出的发布历史应至少 3 条，实际 {len(data['publish_history'])}"
         assert "rules_summary" in data["rule_snapshot"], "应包含 rules_summary"
-        print("[OK] 导出的 JSON 中规则快照与发布历史一致")
+        assert len(data["status_history"]) >= len(status_history_final), "导出的状态历史应完整"
+        print("[OK] 导出的 JSON 中规则快照、发布历史、状态历史一致")
     finally:
         os.unlink(json_path)
 
@@ -712,11 +776,17 @@ def test_rule_snapshot_revoke_republish(examples_dir):
         assert "规则快照" in md, "Markdown 应包含规则快照章节"
         assert str(snap_id_before) in md, "Markdown 应包含快照 ID"
         assert "关键校验项" in md, "Markdown 应包含关键校验项"
-        print("[OK] 导出的 Markdown 中包含规则快照信息")
+        assert "发布与回退历史" in md, "Markdown 应包含发布与回退历史"
+        assert "状态流转" in md, "Markdown 应包含状态流转历史"
+        print("[OK] 导出的 Markdown 中包含规则快照、发布历史、状态流转信息")
     finally:
         os.unlink(md_path)
 
-    print("\n[OK][OK] 回归测试 6 通过: revoke后重发快照保持一致 [OK][OK]")
+    rc = run_cli("status", "test-snapshot-revoke")
+    assert rc == 0, "status 失败"
+    print("[OK] status 命令输出正常")
+
+    print("\n[OK][OK] 回归测试 6 通过: revoke→check→approve→publish 全链路正常 [OK][OK]")
 
 
 def test_rule_snapshot_re_export(examples_dir):

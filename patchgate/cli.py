@@ -573,8 +573,9 @@ def cmd_revoke(args, storage: Storage) -> int:
     print(f"  回退备注   : {args.comment}")
     print(f"  当前状态   : {colorize(final_status.value, final_status)}")
     if final_status == BatchStatus.APPROVED:
-        print(f"  (批次已恢复到审批通过状态，可再次发布或修改)")
-        print(f"  重新发布: patchgate publish {args.batch_id} --operator <姓名>")
+        print(f"  (批次已恢复到审批通过状态，可直接重新发布或修改后重跑校验)")
+        print(f"  直接重新发布: patchgate publish {args.batch_id} --operator <姓名>")
+        print(f"  修改后重跑校验: patchgate check {args.batch_id}")
     return 0
 
 
