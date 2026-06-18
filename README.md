@@ -23,6 +23,9 @@
   - [history - 查看历史](#history---查看历史)
   - [status - 查看当前状态](#status---查看当前状态)
   - [list - 列出所有批次](#list---列出所有批次)
+- [handover-export - 导出接手包](#handover-export---导出接手包)
+- [handover-import - 导入接手包](#handover-import---导入接手包)
+- [handover-list - 查看导入记录](#handover-list---查看导入记录)
 - [状态机与流转规则](#状态机与流转规则)
 - [清单格式](#清单格式)
 - [规则配置](#规则配置)
@@ -31,6 +34,7 @@
   - [演示二：失败链路（预检拒绝 + check 阶段错误 + 驳回）](#演示二失败链路预检拒绝--check-阶段错误--审批阻塞--驳回)
   - [演示三：发布 → 撤销回退 → 重新发布](#演示三发布--撤销回退--重新发布)
   - [演示四：断点续跑（一键到发布）](#演示四断点续跑一键到发布)
+  - [演示五：接手包导出导入全链路](#演示五接手包导出导入全链路)
 - [数据持久化说明](#数据持久化说明)
 
 ---
@@ -751,11 +755,185 @@ $ python patchgate_cli.py resume demo-resume-01 --to publish --approver zhangsan
 
 ---
 
+### 演示五：接手包导出导入全链路
+
+**场景**：张三（zhangsan）负责的 Q2 补丁批次已完成校验和审批，现在要交接给李四（lisi）。张三导出接手包发给李四，李四导入后核对历史结论并继续发布。
+
+**Step 1 - 张三：完成校验和审批**
+```bash
+$ python patchgate_cli.py import examples/manifest_good.json \
+    --id "release-2026-q2" --name "2026年Q2安全补丁"
+[OK] 批次创建成功
+  批次 ID   : release-2026-q2
+  名称      : 2026年Q2安全补丁
+  当前状态  : created
+
+$ python patchgate_cli.py check release-2026-q2
+[>] 开始校验批次 release-2026-q2 ...
+  校验摘要: 共 16 项检查
+    通过 : 11   失败 : 5   警告 : 5   错误 : 0   跳过 : 0
+[OK] 校验通过（仅 warning 不阻塞）
+  当前状态: check_passed
+
+$ python patchgate_cli.py approve release-2026-q2 \
+    --approver zhangsan --comment "所有补丁已代码评审，版本核对无误"
+[OK] 审批通过
+  批次 ID   : release-2026-q2
+  审批人     : zhangsan
+  审批意见   : 所有补丁已代码评审，版本核对无误
+  当前状态   : approved
+```
+
+**Step 2 - 张三：导出接手包**
+```bash
+$ python patchgate_cli.py handover-export release-2026-q2 \
+    -o release-2026-q2-handover.json \
+    -e zhangsan \
+    -n "Q2补丁批次已完成校验和审批，李四接手后可直接发布"
+[OK] 接手包导出成功
+  输出文件   : release-2026-q2-handover.json
+  包哈希     : 6a7b8c9d...
+  包含内容   : 批次信息 + 校验结果 + 审批结论 + 规则快照 + 待办 + 日志索引
+```
+
+张三把 `release-2026-q2-handover.json` 发给李四。
+
+**Step 3 - 李四：先 dry-run 预览**
+```bash
+$ python patchgate_cli.py handover-import release-2026-q2-handover.json \
+    --by lisi --dry-run
+[>] 导入接手包: release-2026-q2-handover.json
+  导入人: lisi
+
+[OK] 接手包格式验证通过
+  包哈希     : 6a7b8c9d...
+  生成时间   : 2026-06-18T10:30:00
+  导出人     : zhangsan
+  批次 ID    : release-2026-q2
+  批次名称   : 2026年Q2安全补丁
+  批次状态   : approved
+
+[OK] 无冲突
+
+[DRY-RUN] 模拟导入成功（未实际写入）
+  新批次 ID : release-2026-q2
+```
+
+**Step 4 - 李四：正式导入**
+```bash
+$ python patchgate_cli.py handover-import release-2026-q2-handover.json \
+    --by lisi -n "从张三处接手Q2补丁批次"
+[>] 导入接手包: release-2026-q2-handover.json
+  导入人: lisi
+  导入备注: 从张三处接手Q2补丁批次
+
+[OK] 接手包格式验证通过
+  ...
+
+[OK] 无冲突
+
+[OK] 接手包导入成功
+  新批次 ID : release-2026-q2
+  导入记录 ID: #1
+
+  当前状态  : approved
+
+📌 接手人待办 📌
+  [!] 已通过审批（zhangsan），可标记发布
+     $ patchgate publish release-2026-q2 --operator <姓名>
+  [-] 如需修改可重新校验
+     $ patchgate check release-2026-q2
+```
+
+**Step 5 - 李四：核对历史结论**
+```bash
+$ python patchgate_cli.py status release-2026-q2
+批次 release-2026-q2
+  名称       : 2026年Q2安全补丁
+  当前状态   : approved
+  ...
+
+📌 接手来源 📌
+  导入记录 #1:
+    原批次 ID : release-2026-q2
+    包哈希    : 6a7b8c9d...
+    导出人    : zhangsan
+    导出时间  : 2026-06-18T10:30:00
+    导出备注  : Q2补丁批次已完成校验和审批...
+    导入人    : lisi
+    导入时间  : 2026-06-18T10:35:00
+    导入备注  : 从张三处接手Q2补丁批次
+
+审批记录:
+  [通过] zhangsan @ 2026-06-18T10:30:00: 所有补丁已代码评审，版本核对无误
+```
+
+李四确认了张三的审批结论和校验结果，与交接说明一致。
+
+**Step 6 - 李四：继续发布**
+```bash
+$ python patchgate_cli.py publish release-2026-q2 \
+    --operator lisi --comment "凌晨2:00-2:30灰度+全量发布完成，监控正常"
+[OK] 已发布
+  批次 ID   : release-2026-q2
+  操作人     : lisi
+  发布备注   : 凌晨2:00-2:30灰度+全量发布完成，监控正常
+  当前状态   : published
+```
+
+**Step 7 - 查看全部导入记录（审计）**
+```bash
+$ python patchgate_cli.py handover-list
++-----+-----------------+-----------------+--------+---------------------+----------+
+|   # | 批次 ID         | 原 ID           | 导入人  | 导入时间             | 导出人    |
++=====+=================+==========+=====================+==========+
+|   1 | release-2026-q2 | release-2026-q2 | lisi   | 2026-06-18T10:35:00 | zhangsan |
++-----+-----------------+-----------------+--------+---------------------+----------+
+```
+
+---
+
+#### 冲突处理示例：同名批次 + 规则变更
+
+如果李四本地已经有一个同名批次，且规则文件与包内快照不一致，导入时会检测到冲突：
+
+```bash
+# 先检测冲突
+$ python patchgate_cli.py handover-import release-2026-q2-handover.json \
+    --by lisi --dry-run
+[!] 检测到 2 个冲突
+
+  1. [严重] 批次 ID 已存在 (type: duplicate_id)
+     可用选项: keep_local, overwrite_with_package, rename_package
+     本地批次: release-2026-q2 (李四本地的Q2批次)
+
+  2. [中等] 本地规则文件与包内快照不一致 (type: rules_changed)
+     可用选项: keep_package_snapshot, switch_to_local_rules
+     差异: 修改 1 条规则 (风险: HIGH)
+
+# 选择解决方案：重命名批次 + 保留包内规则快照
+$ python patchgate_cli.py handover-import release-2026-q2-handover.json \
+    --by lisi \
+    --resolve duplicate_id=rename_package \
+    --resolve rules_changed=keep_package_snapshot
+[OK] 接手包导入成功
+  新批次 ID : release-2026-q2-imported-202606181035
+  导入记录 ID: #2
+
+📌 冲突处理记录 📌
+  - duplicate_id: rename_package
+  - rules_changed: keep_package_snapshot
+```
+
+导入后原批次不受影响，新批次包含接手包的所有数据，且规则快照保留了包内版本。
+
+---
+
 ## 数据持久化说明
 
 **所有数据保存在本地 SQLite 数据库**（默认路径 `.patchgate/patchgate.db`）。
 
-包含 6 张表：
+包含 8 张表：
 
 | 表名 | 用途 |
 |---|---|
@@ -765,9 +943,12 @@ $ python patchgate_cli.py resume demo-resume-01 --to publish --approver zhangsan
 | `approvals` | 审批记录（审批人/决定/备注/时间戳） |
 | `publish_records` | 发布与撤销记录（操作人/动作类型/备注/时间戳） |
 | `status_history` | 每一次状态流转的完整轨迹 |
+| `rule_snapshots` | 规则快照（校验时的规则配置，保证可追溯） |
+| `handover_imports` | 接手包导入记录（审计追溯用，包含导出人、导入人、冲突处理决策） |
 
 **重新执行工具时**：
 - 所有之前的批次、检查结果、审批人、回退备注、导出摘要**保持不变**
+- 接手包导入记录、来源说明、冲突处理决策**持久化保留**，重启后仍可通过 `status` / `history` / `handover-list` 查看
 - 可以在任何时候对任一历史批次执行 `status` / `history` / `export` 查看
 - 未完成的批次（`check_failed` / `rejected` / `approved`）可以随时 `resume` 续跑
 - 已发布的可以随时 `revoke` 回退
