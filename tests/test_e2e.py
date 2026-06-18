@@ -2681,6 +2681,450 @@ def test_handover_readme_example(examples_dir):
     print("\n[OK][OK] 测试八-11 通过: README 示例对照成功 [OK][OK]")
 
 
+def test_handover_verify_pack_preview(examples_dir):
+    """测试九-01: handover-pack 打包含流程快照/审批时间/规则指纹/导入裁决/审计日志定位"""
+    separator("验真台: handover-pack 打包完整性")
+
+    db_path = os.path.join(TEST_DIR, "test_verify_pack.db")
+    clean_db(db_path)
+
+    bid = "test-verify-pack"
+    manifest_src = os.path.join(examples_dir, "manifest_good.json")
+
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "import", manifest_src, "--id", bid, "--name", "验真台-打包测试"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "approve", bid, "--approver", "zhangsan", "--comment", "审批通过"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "publish", bid, "--operator", "lisi", "--comment", "发布完成"])
+    assert rc == 0
+
+    pack_path = os.path.join(TEST_DIR, "verify_pack.json")
+    if os.path.exists(pack_path):
+        os.unlink(pack_path)
+
+    rc, out = run_cli_capture([
+        "--db", db_path, "--no-color",
+        "handover-pack", bid,
+        "--exporter", "zhangsan",
+        "--note", "Q2批次交接",
+        "-o", pack_path,
+    ])
+    assert rc == 0, f"handover-pack 应成功 rc={rc}\n{out}"
+    assert os.path.exists(pack_path), "打包文件应存在"
+
+    with open(pack_path, "r", encoding="utf-8") as f:
+        pkg = json.load(f)
+
+    assert "original_approval_time" in pkg, "应包含 original_approval_time"
+    assert pkg["original_approval_time"] is not None, "original_approval_time 不应为 null"
+
+    assert "rule_version_fingerprint" in pkg, "应包含 rule_version_fingerprint"
+    assert len(pkg["rule_version_fingerprint"]) == 64, "rule_version_fingerprint 应为 SHA256"
+
+    assert "import_ruling" in pkg, "应包含 import_ruling"
+    assert pkg["import_ruling"]["latest_decision"] == "approve"
+    assert pkg["import_ruling"]["latest_approver"] == "zhangsan"
+
+    assert "audit_log_position" in pkg, "应包含 audit_log_position"
+    assert pkg["audit_log_position"]["status_transitions_count"] >= 5
+    assert pkg["audit_log_position"]["approvals_count"] >= 1
+    assert pkg["audit_log_position"]["publish_records_count"] >= 1
+
+    assert "flow_snapshot" in pkg, "应包含 flow_snapshot"
+    assert pkg["flow_snapshot"]["current_status"] == "published"
+    assert len(pkg["flow_snapshot"]["status_transitions"]) >= 5
+
+    assert "latest_validation" in pkg, "应包含 latest_validation"
+
+    assert "note" in pkg, "应包含 note"
+
+    print(f"[OK] handover-pack 输出完整: 原审批时间={pkg['original_approval_time']}")
+    print(f"    规则指纹={pkg['rule_version_fingerprint'][:16]}...")
+    print(f"    导入裁决={pkg['import_ruling']['latest_decision']} by {pkg['import_ruling']['latest_approver']}")
+    print(f"    流程快照: {len(pkg['flow_snapshot']['status_transitions'])} 步流转")
+
+    os.unlink(pack_path)
+
+    print("\n[OK][OK] 测试九-01 通过: handover-pack 打包完整性验证 [OK][OK]")
+
+
+def test_handover_verify_preview(examples_dir):
+    """测试九-02: handover-preview 预览 - 无冲突/有冲突场景"""
+    separator("验真台: handover-preview 预览")
+
+    db_src = os.path.join(TEST_DIR, "test_verify_preview_src.db")
+    db_dst = os.path.join(TEST_DIR, "test_verify_preview_dst.db")
+    clean_db(db_src)
+    clean_db(db_dst)
+
+    bid = "test-verify-preview"
+    manifest_src = os.path.join(examples_dir, "manifest_good.json")
+
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "import", manifest_src, "--id", bid, "--name", "预览测试-源"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "check", bid])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "approve", bid, "--approver", "zhang", "--comment", "审批"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "publish", bid, "--operator", "li", "--comment", "发布"])
+    assert rc == 0
+
+    pack_path = os.path.join(TEST_DIR, "verify_preview.json")
+    if os.path.exists(pack_path):
+        os.unlink(pack_path)
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "handover-pack", bid, "--exporter", "zhang", "-o", pack_path])
+    assert rc == 0
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-preview", pack_path, "--by", "wang"])
+    assert rc == 0, f"预览应成功 rc={rc}\n{out}"
+    assert "无冲突" in out, "空库预览应显示无冲突"
+    assert "原审批时间" in out, "预览应显示原审批时间"
+    assert "规则版本指纹" in out, "预览应显示规则指纹"
+    print("[OK] 空库预览: 无冲突，显示审批时间和规则指纹")
+
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "handover-preview", pack_path, "--by", "zhang"])
+    assert rc == 0
+    assert "duplicate_id" in out, "同库预览应检测到 duplicate_id 冲突"
+    print("[OK] 同库预览: 检测到 duplicate_id 冲突")
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-import", pack_path, "--by", "wang"])
+    assert rc == 0
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-preview", pack_path, "--by", "wang"])
+    assert rc == 0
+    assert "duplicate_import" in out, "重复导入应检测到 duplicate_import"
+    print("[OK] 重复导入预览: 检测到 duplicate_import 冲突")
+
+    os.unlink(pack_path)
+
+    print("\n[OK][OK] 测试九-02 通过: handover-preview 预览完整 [OK][OK]")
+
+
+def test_handover_verify_import_then_verify(examples_dir):
+    """测试九-03: handover-import 导入后 handover-verify 核对一致性"""
+    separator("验真台: import → verify 一致性核对")
+
+    db_src = os.path.join(TEST_DIR, "test_verify_imp_src.db")
+    db_dst = os.path.join(TEST_DIR, "test_verify_imp_dst.db")
+    clean_db(db_src)
+    clean_db(db_dst)
+
+    bid = "test-verify-imp"
+    manifest_src = os.path.join(examples_dir, "manifest_good.json")
+
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "import", manifest_src, "--id", bid, "--name", "核对测试-源"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "check", bid])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "approve", bid, "--approver", "zhang", "--comment", "审批"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "publish", bid, "--operator", "li", "--comment", "发布"])
+    assert rc == 0
+
+    pack_path = os.path.join(TEST_DIR, "verify_imp.json")
+    if os.path.exists(pack_path):
+        os.unlink(pack_path)
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "handover-pack", bid, "--exporter", "zhang", "-o", pack_path])
+    assert rc == 0
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-import", pack_path, "--by", "wang", "--note", "接手"])
+    assert rc == 0
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-verify", bid])
+    assert rc == 0, f"verify 应成功 rc={rc}\n{out}"
+    assert "规则版本指纹" in out, "verify 应显示规则指纹"
+    assert "审批" in out, "verify 应显示审批结论"
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-verify", bid, "--package", pack_path])
+    assert rc == 0
+    assert "交叉核对" in out, "带包文件应做交叉核对"
+    assert "规则版本指纹一致" in out, "规则指纹应一致"
+    print("[OK] verify 核对: 本地状态+交叉核对 通过")
+
+    storage_dst = Storage(db_dst)
+    audit_logs = storage_dst.get_audit_log(bid)
+    assert len(audit_logs) >= 2, "应有审计日志（import + verify）"
+    actions = [a["action"] for a in audit_logs]
+    assert "handover_import" in actions
+    assert "handover_verify" in actions
+    print(f"[OK] 审计日志: {len(audit_logs)} 条 (import + verify)")
+
+    os.unlink(pack_path)
+
+    print("\n[OK][OK] 测试九-03 通过: import → verify 一致性核对完整 [OK][OK]")
+
+
+def test_handover_verify_revoke_import(examples_dir):
+    """测试九-04: handover-revoke-import 撤销导入后数据清除、记录保留"""
+    separator("验真台: handover-revoke-import 撤销导入")
+
+    db_src = os.path.join(TEST_DIR, "test_verify_revoke_src.db")
+    db_dst = os.path.join(TEST_DIR, "test_verify_revoke_dst.db")
+    clean_db(db_src)
+    clean_db(db_dst)
+
+    bid = "test-verify-revoke"
+    manifest_src = os.path.join(examples_dir, "manifest_good.json")
+
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "import", manifest_src, "--id", bid, "--name", "撤销测试-源"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "check", bid])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "approve", bid, "--approver", "zhang", "--comment", "审批"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "publish", bid, "--operator", "li", "--comment", "发布"])
+    assert rc == 0
+
+    pack_path = os.path.join(TEST_DIR, "verify_revoke.json")
+    if os.path.exists(pack_path):
+        os.unlink(pack_path)
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "handover-pack", bid, "--exporter", "zhang", "-o", pack_path])
+    assert rc == 0
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-import", pack_path, "--by", "wang", "--note", "先导入再撤销"])
+    assert rc == 0
+    assert "导入记录 ID: #1" in out or "#1" in out
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-revoke-import", "1", "--actor", "admin", "--comment", "撤销测试导入"])
+    assert rc == 0, f"撤销导入应成功 rc={rc}\n{out}"
+    assert "已撤销" in out
+
+    storage_dst = Storage(db_dst)
+    batch_after = storage_dst.get_batch(bid)
+    assert batch_after is None, "撤销导入后批次应被删除"
+
+    import_rec = storage_dst.get_handover_import_by_id(1)
+    assert import_rec is not None, "导入记录应保留"
+    assert import_rec["revoked"], "导入记录应标记为已撤销"
+    assert import_rec["revoke_actor"] == "admin", "撤销人应为 admin"
+    assert "撤销测试导入" in (import_rec.get("revoke_note") or ""), "应保留撤销原因"
+    print("[OK] 撤销导入: 批次已删除，导入记录保留并标记已撤销")
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-list"])
+    assert rc == 0
+    assert "已撤销" in out, "handover-list 应显示已撤销状态"
+    print("[OK] handover-list 显示已撤销记录")
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-import", pack_path, "--by", "wang2", "--note", "撤销后重新导入", "--resolve", "duplicate_import=force_reimport"])
+    assert rc == 0, f"撤销后重新导入应成功 rc={rc}\n{out}"
+
+    storage_dst2 = Storage(db_dst)
+    batch_new = storage_dst2.get_batch(bid)
+    assert batch_new is not None, "重新导入后批次应存在"
+    print("[OK] 撤销后可重新导入")
+
+    os.unlink(pack_path)
+
+    print("\n[OK][OK] 测试九-04 通过: revoke-import 撤销导入完整 [OK][OK]")
+
+
+def test_handover_verify_config_pack(examples_dir):
+    """测试九-05: handover-pack --config 指定导出目录和命名规则"""
+    separator("验真台: handover-pack --config 配置导出")
+
+    db_path = os.path.join(TEST_DIR, "test_verify_config.db")
+    clean_db(db_path)
+
+    bid = "test-verify-config"
+    manifest_src = os.path.join(examples_dir, "manifest_good.json")
+
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "import", manifest_src, "--id", bid, "--name", "配置测试"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "check", bid])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "approve", bid, "--approver", "zhang", "--comment", "审批"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "publish", bid, "--operator", "li", "--comment", "发布"])
+    assert rc == 0
+
+    config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "config", "handover_config.yaml")
+    assert os.path.exists(config_path), f"配置文件应存在: {config_path}"
+
+    rc, out = run_cli_capture(["--db", db_path, "--no-color", "handover-pack", bid, "--exporter", "zhang", "--config", config_path])
+    assert rc == 0, f"handover-pack --config 应成功 rc={rc}\n{out}"
+
+    export_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "handover_packages")
+    assert os.path.exists(export_dir), f"配置导出目录应存在: {export_dir}"
+
+    exported_files = [f for f in os.listdir(export_dir) if f.endswith(".json") and bid in f]
+    assert len(exported_files) >= 1, f"应有导出文件包含 {bid}"
+    print(f"[OK] --config 导出成功: {exported_files[-1]}")
+
+    os.unlink(os.path.join(export_dir, exported_files[-1]))
+
+    print("\n[OK][OK] 测试九-05 通过: handover-pack --config 配置导出正确 [OK][OK]")
+
+
+def test_handover_verify_cross_restart_consistency(examples_dir):
+    """测试九-06: 程序重启后 status/history/重新打包 的来源/结论/裁决仍能对上"""
+    separator("验真台: 跨重启一致性")
+
+    db_src = os.path.join(TEST_DIR, "test_verify_restart_src.db")
+    db_dst = os.path.join(TEST_DIR, "test_verify_restart_dst.db")
+    clean_db(db_src)
+    clean_db(db_dst)
+
+    bid = "test-verify-restart"
+    manifest_src = os.path.join(examples_dir, "manifest_good.json")
+
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "import", manifest_src, "--id", bid, "--name", "重启一致性-源"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "check", bid])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "approve", bid, "--approver", "zhang", "--comment", "审批"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "publish", bid, "--operator", "li", "--comment", "发布"])
+    assert rc == 0
+
+    pack_path = os.path.join(TEST_DIR, "verify_restart.json")
+    if os.path.exists(pack_path):
+        os.unlink(pack_path)
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "handover-pack", bid, "--exporter", "zhang", "-o", pack_path])
+    assert rc == 0
+
+    with open(pack_path, "r", encoding="utf-8") as f:
+        pkg_original = json.load(f)
+
+    original_ruling = pkg_original["import_ruling"]["latest_decision"]
+    original_approver = pkg_original["import_ruling"]["latest_approver"]
+    original_approval_time = pkg_original["original_approval_time"]
+    original_fingerprint = pkg_original["rule_version_fingerprint"]
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-import", pack_path, "--by", "wang", "--note", "接手"])
+    assert rc == 0
+
+    storage_after_import = Storage(db_dst)
+    imports_after = storage_after_import.get_handover_imports_for_batch(bid)
+    assert len(imports_after) == 1
+
+    storage_restarted = Storage(db_dst)
+    batch_restarted = storage_restarted.get_batch(bid)
+    assert batch_restarted is not None
+    assert batch_restarted["status"] == "published"
+    print(f"[OK] 重启后批次存在: {bid}, status={batch_restarted['status']}")
+
+    approvals_restarted = storage_restarted.get_approvals(bid)
+    assert len(approvals_restarted) == 1
+    assert approvals_restarted[0]["decision"] == original_ruling
+    assert approvals_restarted[0]["approver"] == original_approver
+    print(f"[OK] 重启后审批结论一致: {original_ruling} by {original_approver}")
+
+    snap_restarted = storage_restarted.get_active_rule_snapshot(bid)
+    assert snap_restarted is not None
+    assert snap_restarted["rules_sha256"] == original_fingerprint
+    print(f"[OK] 重启后规则指纹一致: {original_fingerprint[:16]}...")
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-verify", bid])
+    assert rc == 0
+    assert original_fingerprint[:16] in out or "规则版本指纹" in out
+    print("[OK] 重启后 verify 核对通过")
+
+    pack2_path = os.path.join(TEST_DIR, "verify_restart2.json")
+    if os.path.exists(pack2_path):
+        os.unlink(pack2_path)
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-pack", bid, "--exporter", "wang", "-o", pack2_path])
+    assert rc == 0
+
+    with open(pack2_path, "r", encoding="utf-8") as f:
+        pkg_restarted = json.load(f)
+
+    assert pkg_restarted["import_ruling"]["latest_decision"] == original_ruling
+    assert pkg_restarted["import_ruling"]["latest_approver"] == original_approver
+    assert pkg_restarted["rule_version_fingerprint"] == original_fingerprint
+    print("[OK] 重新打包后: 裁决/审批人/规则指纹 与原始包一致")
+
+    imports_restarted = storage_restarted.get_handover_imports_for_batch(bid)
+    assert len(imports_restarted) == 1
+    assert imports_restarted[0]["imported_by"] == "wang"
+    assert imports_restarted[0]["package_generated_by"] == "zhang"
+    print("[OK] 重启后导入记录来源完整")
+
+    os.unlink(pack_path)
+    os.unlink(pack2_path)
+
+    print("\n[OK][OK] 测试九-06 通过: 跨重启一致性验证 [OK][OK]")
+
+
+def test_handover_verify_e2e_workflow(examples_dir):
+    """测试九-07: 端到端完整流程 pack → preview → import → verify → revoke-import → re-import → re-verify"""
+    separator("验真台: 端到端完整流程")
+
+    db_src = os.path.join(TEST_DIR, "test_verify_e2e_src.db")
+    db_dst = os.path.join(TEST_DIR, "test_verify_e2e_dst.db")
+    clean_db(db_src)
+    clean_db(db_dst)
+
+    bid = "test-verify-e2e"
+    manifest_src = os.path.join(examples_dir, "manifest_good.json")
+
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "import", manifest_src, "--id", bid, "--name", "端到端-源"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "check", bid])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "approve", bid, "--approver", "zhang", "--comment", "审批"])
+    assert rc == 0
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "publish", bid, "--operator", "li", "--comment", "发布"])
+    assert rc == 0
+    print("[OK] 源端: import → check → approve → publish")
+
+    pack_path = os.path.join(TEST_DIR, "verify_e2e.json")
+    if os.path.exists(pack_path):
+        os.unlink(pack_path)
+    rc, out = run_cli_capture(["--db", db_src, "--no-color", "handover-pack", bid, "--exporter", "zhang", "--note", "E2E测试", "-o", pack_path])
+    assert rc == 0
+    assert "流程快照" in out
+    assert "原审批时间" in out
+    assert "规则版本指纹" in out
+    assert "导入裁决" in out
+    print("[OK] handover-pack: 含流程快照/审批时间/规则指纹/导入裁决")
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-preview", pack_path, "--by", "wang"])
+    assert rc == 0
+    assert "无冲突" in out
+    print("[OK] handover-preview: 无冲突")
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-import", pack_path, "--by", "wang", "--note", "E2E导入"])
+    assert rc == 0
+    print("[OK] handover-import: 导入成功")
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-verify", bid, "--package", pack_path])
+    assert rc == 0
+    assert "交叉核对" in out
+    assert "规则版本指纹一致" in out
+    print("[OK] handover-verify: 交叉核对通过")
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-revoke-import", "1", "--actor", "admin", "--comment", "E2E撤销"])
+    assert rc == 0
+    assert "已撤销" in out
+    print("[OK] handover-revoke-import: 撤销成功")
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-import", pack_path, "--by", "wang2", "--note", "E2E重新导入", "--resolve", "duplicate_import=force_reimport"])
+    assert rc == 0
+    print("[OK] 重新导入: force_reimport 成功")
+
+    rc, out = run_cli_capture(["--db", db_dst, "--no-color", "handover-verify", bid])
+    assert rc == 0
+    print("[OK] 二次核对: 通过")
+
+    storage_dst = Storage(db_dst)
+    audit_logs = storage_dst.get_audit_log(bid)
+    revoke_logs = storage_dst.get_audit_log_by_reference(1, "handover_import")
+    all_logs = audit_logs + revoke_logs
+    actions = [a["action"] for a in all_logs]
+    assert "handover_import" in actions, f"审计日志应包含 handover_import, 实际: {actions}"
+    assert "handover_revoke_import" in actions, f"审计日志应包含 handover_revoke_import, 实际: {actions}"
+    assert "handover_verify" in actions, f"审计日志应包含 handover_verify, 实际: {actions}"
+    print(f"[OK] 审计日志完整: {len(audit_logs)} 条, 包含 import/revoke/verify")
+
+    os.unlink(pack_path)
+
+    print("\n[OK][OK] 测试九-07 通过: 端到端完整流程验证 [OK][OK]")
+
+
 def main():
     examples_dir, config_dir = cleanup()
     all_passed = True
@@ -2720,6 +3164,13 @@ def main():
         ("接手包-跨重启持久化", lambda: test_handover_cross_restart_persistence(examples_dir)),
         ("接手包-完整工作流", lambda: test_handover_full_workflow(examples_dir)),
         ("接手包-README示例对照", lambda: test_handover_readme_example(examples_dir)),
+        ("验真台-handover-pack完整性", lambda: test_handover_verify_pack_preview(examples_dir)),
+        ("验真台-handover-preview预览", lambda: test_handover_verify_preview(examples_dir)),
+        ("验真台-import+verify核对", lambda: test_handover_verify_import_then_verify(examples_dir)),
+        ("验真台-revoke-import撤销", lambda: test_handover_verify_revoke_import(examples_dir)),
+        ("验真台-config配置导出", lambda: test_handover_verify_config_pack(examples_dir)),
+        ("验真台-跨重启一致性", lambda: test_handover_verify_cross_restart_consistency(examples_dir)),
+        ("验真台-端到端完整流程", lambda: test_handover_verify_e2e_workflow(examples_dir)),
     ]
     results = []
     for name, fn in tests:

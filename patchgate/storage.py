@@ -155,7 +155,7 @@ class Storage:
 
                 CREATE TABLE IF NOT EXISTS handover_imports (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    batch_id TEXT NOT NULL,
+                    batch_id TEXT,
                     original_batch_id TEXT,
                     package_hash TEXT NOT NULL,
                     package_generated_at TEXT NOT NULL,
@@ -165,15 +165,45 @@ class Storage:
                     imported_by TEXT,
                     import_note TEXT,
                     resolution_summary TEXT,
-                    FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE CASCADE
+                    FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE SET NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_handover_imports_batch ON handover_imports(batch_id);
                 CREATE INDEX IF NOT EXISTS idx_handover_imports_hash ON handover_imports(package_hash);
+
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id TEXT,
+                    action TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    detail_json TEXT,
+                    reference_id INTEGER,
+                    reference_type TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE SET NULL
+                );
+                CREATE INDEX IF NOT EXISTS audit_log_batch ON audit_log(batch_id);
+                CREATE INDEX IF NOT EXISTS audit_log_action ON audit_log(action);
                 """
             )
         with self._conn() as conn:
             try:
                 conn.execute("ALTER TABLE handover_imports ADD COLUMN package_note TEXT")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE handover_imports ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE handover_imports ADD COLUMN revoked_at TEXT")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE handover_imports ADD COLUMN revoke_actor TEXT")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE handover_imports ADD COLUMN revoke_note TEXT")
             except Exception:
                 pass
 
@@ -719,3 +749,61 @@ class Storage:
                 "SELECT * FROM handover_imports ORDER BY id DESC"
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def add_audit_log(self, batch_id, action, actor, detail=None, reference_id=None, reference_type=None) -> int:
+        now = self._now()
+        with self._conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO audit_log (batch_id, action, actor, detail_json, reference_id, reference_type, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (batch_id, action, actor,
+                 json.dumps(detail, ensure_ascii=False) if detail else None,
+                 reference_id, reference_type, now),
+            )
+            return cur.lastrowid
+
+    def get_audit_log(self, batch_id, action=None) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            sql = "SELECT * FROM audit_log WHERE batch_id = ?"
+            params = [batch_id]
+            if action:
+                sql += " AND action = ?"
+                params.append(action)
+            sql += " ORDER BY id"
+            rows = conn.execute(sql, params).fetchall()
+            results = []
+            for r in rows:
+                d = dict(r)
+                if d.get("detail_json"):
+                    d["detail"] = json.loads(d["detail_json"])
+                    del d["detail_json"]
+                results.append(d)
+            return results
+
+    def get_audit_log_by_reference(self, reference_id, reference_type) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM audit_log WHERE reference_id = ? AND reference_type = ? ORDER BY id",
+                (reference_id, reference_type),
+            ).fetchall()
+            results = []
+            for r in rows:
+                d = dict(r)
+                if d.get("detail_json"):
+                    d["detail"] = json.loads(d["detail_json"])
+                    del d["detail_json"]
+                results.append(d)
+            return results
+
+    def revoke_handover_import(self, import_id, actor, note=None):
+        now = self._now()
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE handover_imports SET revoked = 1, revoked_at = ?, revoke_actor = ?, revoke_note = ? WHERE id = ?",
+                (now, actor, note, import_id),
+            )
+
+    def get_handover_import_by_id(self, import_id):
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM handover_imports WHERE id = ?", (import_id,)).fetchone()
+            return dict(row) if row else None

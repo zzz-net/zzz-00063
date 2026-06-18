@@ -177,6 +177,40 @@ def build_handover_package(
             "revoke_time": revoke_ctx.get("created_at"),
             "restore_note": revoke_ctx.get("restore_note"),
         } if revoke_ctx else None,
+        "original_approval_time": last_approval["created_at"] if last_approval else None,
+        "rule_version_fingerprint": active_snapshot["rules_sha256"] if active_snapshot else None,
+        "import_ruling": {
+            "latest_decision": last_approval["decision"] if last_approval else (
+                last_rejection["decision"] if last_rejection else None
+            ),
+            "latest_approver": last_approval["approver"] if last_approval else (
+                last_rejection["approver"] if last_rejection else None
+            ),
+            "latest_at": last_approval["created_at"] if last_approval else (
+                last_rejection["created_at"] if last_rejection else None
+            ),
+            "ruling_context": batch["status"],
+        },
+        "audit_log_position": {
+            "status_transitions_count": len(status_history),
+            "approvals_count": len(approvals),
+            "publish_records_count": len(publish_records),
+            "snapshot_decisions_count": len(snapshot_decisions),
+            "latest_audit_timestamp": max(
+                [s["created_at"] for s in status_history] +
+                [a["created_at"] for a in approvals] +
+                [p["created_at"] for p in publish_records] +
+                [sd["created_at"] for sd in snapshot_decisions],
+                default=None,
+            ),
+        },
+        "flow_snapshot": {
+            "current_status": batch["status"],
+            "status_transitions": [
+                {"from": s.get("from_status"), "to": s["to_status"], "at": s["created_at"]}
+                for s in status_history
+            ],
+        },
     }
 
     package["package_hash"] = _calculate_package_hash(package)
@@ -467,6 +501,21 @@ def detect_import_conflicts(
             "resolution_options": ["skip", "force_reimport"],
         })
 
+    if existing:
+        drift_diffs = _build_import_diffs(storage, package)
+        content_drifts = [d for d in drift_diffs if d["type"] == "content_drift"]
+        if content_drifts:
+            drift_details = []
+            for d in content_drifts:
+                drift_details.append({"item": d["key"][0], "changes": d["changes"]})
+            conflicts.append({
+                "type": "content_drift",
+                "severity": "medium",
+                "description": f"检测到 {len(content_drifts)} 个条目内容漂移",
+                "details": {"drift_items": drift_details},
+                "resolution_options": ["keep_local", "overwrite_with_package", "merge_keep_both"],
+            })
+
     return conflicts
 
 
@@ -674,3 +723,102 @@ def load_handover_from_file(file_path: str) -> Dict[str, Any]:
         raise FileNotFoundError(f"接手包文件不存在: {file_path}")
     with open(file_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def preview_handover_import(
+    storage: Storage,
+    package: Dict[str, Any],
+) -> Dict[str, Any]:
+    is_valid, errors = validate_handover_package(package)
+    if not is_valid:
+        return {"valid": False, "errors": errors, "conflicts": [], "diffs": []}
+
+    conflicts = detect_import_conflicts(storage, package)
+    diffs = _build_import_diffs(storage, package)
+    return {"valid": True, "errors": [], "conflicts": conflicts, "diffs": diffs}
+
+
+def _build_import_diffs(
+    storage: Storage,
+    package: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    diffs = []
+    batch_id = package["batch"]["id"]
+    existing = storage.get_batch(batch_id)
+
+    if existing:
+        pkg_items = {(it["package_name"], it.get("version")): it for it in package["batch"]["items"]}
+        local_items = {}
+        for it in existing["items"]:
+            key = (it["package_name"], it.get("version"))
+            local_items[key] = it
+
+        all_keys = set(pkg_items.keys()) | set(local_items.keys())
+        for key in sorted(all_keys):
+            pkg_item = pkg_items.get(key)
+            local_item = local_items.get(key)
+            if pkg_item and not local_item:
+                diffs.append({"type": "item_added", "key": key, "description": f"包内新增: {key[0]}@{key[1]}"})
+            elif local_item and not pkg_item:
+                diffs.append({"type": "item_removed", "key": key, "description": f"包内缺失: {key[0]}@{key[1]}"})
+            elif pkg_item and local_item:
+                changes = []
+                for field in ("version", "source_path", "checksum"):
+                    pv = pkg_item.get(field)
+                    lv = local_item.get(field)
+                    if pv != lv:
+                        changes.append({"field": field, "package_value": pv, "local_value": lv})
+                if changes:
+                    diffs.append({"type": "content_drift", "key": key, "description": f"内容漂移: {key[0]}@{key[1]}", "changes": changes})
+
+    pkg_approval = package.get("approval_conclusion", {})
+    if pkg_approval and pkg_approval.get("latest_at"):
+        local_approvals = storage.get_approvals(batch_id) if existing else []
+        if local_approvals:
+            last_local = next((a for a in local_approvals if a["decision"] == "approve"), None)
+            if last_local and last_local["created_at"] != pkg_approval["latest_at"]:
+                diffs.append({
+                    "type": "approval_time_drift",
+                    "description": "审批时间漂移",
+                    "package_approval_at": pkg_approval["latest_at"],
+                    "local_approval_at": last_local["created_at"],
+                })
+
+    active_snap = package.get("rule_snapshots", {}).get("active")
+    if active_snap and existing:
+        local_snap = storage.get_active_rule_snapshot(batch_id)
+        if local_snap and local_snap["rules_sha256"] != active_snap["rules_sha256"]:
+            diffs.append({
+                "type": "rule_fingerprint_drift",
+                "description": "规则版本指纹漂移",
+                "package_fingerprint": active_snap["rules_sha256"][:16] + "...",
+                "local_fingerprint": local_snap["rules_sha256"][:16] + "...",
+            })
+
+    return diffs
+
+
+def detect_content_drift_conflict(
+    storage: Storage,
+    package: Dict[str, Any],
+    existing: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    if not existing:
+        existing = storage.get_batch(package["batch"]["id"])
+    if not existing:
+        return None
+
+    drift_diffs = _build_import_diffs(storage, package)
+    content_drifts = [d for d in drift_diffs if d["type"] == "content_drift"]
+    if content_drifts:
+        drift_details = []
+        for d in content_drifts:
+            drift_details.append({"item": d["key"][0], "changes": d["changes"]})
+        return {
+            "type": "content_drift",
+            "severity": "medium",
+            "description": f"检测到 {len(content_drifts)} 个条目内容漂移",
+            "details": {"drift_items": drift_details},
+            "resolution_options": ["keep_local", "overwrite_with_package", "merge_keep_both"],
+        }
+    return None

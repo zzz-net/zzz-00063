@@ -1,0 +1,3 @@
+handover:
+  export_dir: "./handover_packages"
+  naming_rule: "{batch_id}_{timestamp}"
